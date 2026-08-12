@@ -60,6 +60,8 @@ export interface ForwardRule {
   cf_ruleset_id: string
   cf_rule_id: string
   dns_record_id: string
+  user_id: number
+  username?: string
 }
 
 export interface CFAccount {

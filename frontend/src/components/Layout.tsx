@@ -34,26 +34,27 @@ function Layout() {
     navigate('/login')
   }
 
+  // 所有登录用户可见
   const menuItems = [
     {
       key: '/forward-rules',
       icon: <SwapOutlined />,
       label: '端口转发',
     },
-    {
+  ]
+
+  // 以下仅管理员可见
+  if (user?.role === 'admin') {
+    menuItems.push({
       key: '/zones',
       icon: <GlobalOutlined />,
       label: '域名管理',
-    },
-    {
+    })
+    menuItems.push({
       key: '/accounts',
       icon: <UserOutlined />,
       label: '账号管理',
-    },
-  ]
-
-  // 只有管理员能看到用户管理和设置
-  if (user?.role === 'admin') {
+    })
     menuItems.push({
       key: '/users',
       icon: <TeamOutlined />,

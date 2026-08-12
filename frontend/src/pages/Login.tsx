@@ -18,7 +18,12 @@ function Login() {
         localStorage.setItem('token', res.data.result.token)
         localStorage.setItem('user', JSON.stringify(res.data.result))
         message.success('登录成功')
-        navigate('/forward-rules')
+        // 首次登录需先修改密码
+        if (res.data.result.must_change_password) {
+          navigate('/change-password')
+        } else {
+          navigate('/forward-rules')
+        }
       }
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : '登录失败'
@@ -66,9 +71,6 @@ function Login() {
             </Button>
           </Form.Item>
         </Form>
-        <div style={{ textAlign: 'center', color: '#999' }}>
-          默认账号: admin / admin123
-        </div>
       </Card>
     </div>
   )

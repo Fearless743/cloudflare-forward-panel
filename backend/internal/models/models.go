@@ -6,14 +6,15 @@ import (
 
 // User 用户模型
 type User struct {
-	ID           uint       `gorm:"primaryKey" json:"id"`
-	Username     string     `gorm:"uniqueIndex" json:"username"`
-	Password     string     `json:"-"`  // 不返回密码
-	Role         string     `gorm:"default:user" json:"role"`  // admin 或 user
-	IsActive     bool       `gorm:"default:true" json:"is_active"`
-	Subscription *time.Time `json:"subscription"`  // 订阅过期时间，nil 表示永久
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	ID                uint       `gorm:"primaryKey" json:"id"`
+	Username          string     `gorm:"uniqueIndex" json:"username"`
+	Password          string     `json:"-"`  // 不返回密码
+	Role              string     `gorm:"default:user" json:"role"`  // admin 或 user
+	IsActive          bool       `gorm:"default:true" json:"is_active"`
+	MustChangePassword bool      `gorm:"default:false" json:"must_change_password"` // 首次登录需强制修改密码
+	Subscription      *time.Time `json:"subscription"`  // 订阅过期时间，nil 表示永久
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 // Setting 存储配置项（键值对）
@@ -41,6 +42,7 @@ type CFAccount struct {
 type Zone struct {
 	ID          uint      `gorm:"primaryKey" json:"id"`
 	CFID        string    `gorm:"uniqueIndex" json:"cf_id"`
+	AccountID   uint      `gorm:"index" json:"account_id"` // 所属 CF 账号
 	Name        string    `json:"name"`
 	Status      string    `json:"status"`
 	NameServers string    `json:"name_servers"`
@@ -53,6 +55,7 @@ type Zone struct {
 type ForwardRule struct {
 	ID          uint   `gorm:"primaryKey" json:"id"`
 	UserID      uint   `gorm:"index" json:"user_id"`        // 关联用户
+	AccountID   uint   `gorm:"index" json:"account_id"`     // 所属 CF 账号（承载该规则的 Zone）
 	ZoneID      string `gorm:"index" json:"zone_id"`       // Cloudflare Zone ID
 	ZoneName    string `json:"zone_name"`                    // 域名（便于显示）
 	Hostname    string `json:"hostname"`                     // 主机名（子域名）

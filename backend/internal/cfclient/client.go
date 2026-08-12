@@ -143,10 +143,10 @@ func (c *Client) doRequest(method, path string, body interface{}) (*CFResponse, 
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	// 调试日志：显示 api key 前缀
+	// 调试日志：只显示 api key 前缀，避免泄露完整密钥
 	keyPrefix := c.apiKey
-	if len(keyPrefix) > 10 {
-		keyPrefix = keyPrefix[:10] + "..."
+	if len(keyPrefix) > 4 {
+		keyPrefix = keyPrefix[:4] + "..."
 	}
 	log.Printf("[CF API] %s %s, email: %s, key prefix: %s", method, path, c.email, keyPrefix)
 
@@ -374,6 +374,20 @@ func (c *Client) UpdateOriginRuleset(zoneID, rulesetID string, ruleset *OriginRu
 
 func (c *Client) DeleteOriginRuleset(zoneID, rulesetID string) error {
 	_, err := c.doRequest("DELETE", fmt.Sprintf("/zones/%s/rulesets/%s", zoneID, rulesetID), nil)
+	return err
+}
+
+// DisableOriginRule 停用 ruleset 中的所有规则（封禁账号时尽力停用 CF 侧规则）
+// 失败返回错误，调用方自行决定是否忽略
+func (c *Client) DisableOriginRule(zoneID, rulesetID string) error {
+	ruleset, err := c.GetOriginRuleset(zoneID, rulesetID)
+	if err != nil {
+		return err
+	}
+	for i := range ruleset.Rules {
+		ruleset.Rules[i].Enabled = false
+	}
+	_, err = c.UpdateOriginRuleset(zoneID, rulesetID, ruleset)
 	return err
 }
 

@@ -60,6 +60,9 @@ func main() {
 	handler := api.NewHandler(db, cfManager, cfg)
 	router := handler.Router()
 
+	// 账号被封禁时，自动迁移其名下转发规则到其他账号
+	cfManager.SetOnAccountBlocked(handler.MigrateAccountRules)
+
 	// 启动导入调度器
 	handler.StartImportScheduler()
 
@@ -67,7 +70,6 @@ func main() {
 	log.Printf("Server starting on %s", addr)
 	log.Printf("Frontend: http://localhost:%s", cfg.ServerPort)
 	log.Printf("可用 CF 账号数量: %d", cfManager.GetClientCount())
-	log.Printf("默认管理员账号: admin / admin123")
 	if telegramClient.IsConfigured() {
 		log.Printf("Telegram 通知已配置")
 	}
@@ -89,16 +91,17 @@ func initAdminAccount(db *gorm.DB) {
 		}
 
 		admin := models.User{
-			Username: "admin",
-			Password: hash,
-			Role:     "admin",
-			IsActive: true,
+			Username:           "admin",
+			Password:           hash,
+			Role:               "admin",
+			IsActive:           true,
+			MustChangePassword: true, // 首次登录强制修改密码
 		}
 
 		if err := db.Create(&admin).Error; err != nil {
 			log.Fatalf("Failed to create admin account: %v", err)
 		}
-		log.Println("Created default admin account: admin / admin123")
+		log.Println("Created default admin account, must change password on first login")
 	}
 }
 

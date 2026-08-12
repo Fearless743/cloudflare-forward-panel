@@ -12,6 +12,8 @@ export interface ForwardRule {
   cf_ruleset_id: string
   cf_rule_id: string
   dns_record_id: string
+  user_id: number
+  username?: string
 }
 
 export interface User {
@@ -38,7 +40,7 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-// 响应拦截器 - 处理 401 错误
+// 响应拦截器 - 处理 401 / 403 错误
 api.interceptors.response.use(
   (response) => response,
   (error) => {
@@ -46,6 +48,12 @@ api.interceptors.response.use(
       localStorage.removeItem('token')
       localStorage.removeItem('user')
       window.location.href = '/login'
+    } else if (error.response?.status === 403) {
+      const msg = error.response?.data?.error || ''
+      // 首次登录需修改密码：跳转到改密页
+      if (msg.includes('修改密码') || msg.includes('change-password')) {
+        window.location.href = '/change-password'
+      }
     }
     const message = error.response?.data?.error || error.message || '请求失败'
     return Promise.reject(new Error(message))
@@ -135,9 +143,9 @@ export const unblockAccount = (id: number) =>
 
 // Auth
 export const login = (username: string, password: string) =>
-  api.post<CFResponse<{ token: string; username: string; role: string }>>('/auth/login', { username, password })
-export const register = (username: string, password: string) =>
-  api.post<CFResponse<{ message: string }>>('/auth/register', { username, password })
+  api.post<CFResponse<{ token: string; username: string; role: string; must_change_password: boolean }>>('/auth/login', { username, password })
+export const changePassword = (oldPassword: string, newPassword: string) =>
+  api.post<CFResponse<{ token: string }>>('/auth/change-password', { old_password: oldPassword, new_password: newPassword })
 export const getCurrentUser = () =>
   api.get<CFResponse<{ user_id: number; username: string; role: string }>>('/auth/me')
 

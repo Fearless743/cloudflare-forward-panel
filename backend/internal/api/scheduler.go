@@ -49,15 +49,19 @@ func (s *ImportScheduler) Start() {
 	log.Printf("[ImportScheduler] 已启动，轮询间隔 %v", s.interval)
 }
 
-// RetryFailed 将失败/跳过/部分成功的任务重置回 pending，重新处理
-func (s *ImportScheduler) RetryFailed() int {
-	result := s.db.Model(&models.RegistrarDomain{}).
-		Where("status IN ?", []string{"failed", "skipped", "partial"}).
-		Updates(map[string]interface{}{
-			"status":      "pending",
-			"error_msg":   "",
-			"retry_count": 0,
-		})
+// RetryFailed 将失败/跳过/部分成功的任务重置回 pending，重新处理。
+// registrarID 为 0 时重试所有注册商，否则只重试指定注册商。
+func (s *ImportScheduler) RetryFailed(registrarID uint) int {
+	query := s.db.Model(&models.RegistrarDomain{}).
+		Where("status IN ?", []string{"failed", "skipped", "partial"})
+	if registrarID != 0 {
+		query = query.Where("registrar_id = ?", registrarID)
+	}
+	result := query.Updates(map[string]interface{}{
+		"status":      "pending",
+		"error_msg":   "",
+		"retry_count": 0,
+	})
 	s.Trigger()
 	return int(result.RowsAffected)
 }
@@ -153,6 +157,7 @@ func (s *ImportScheduler) processPending() {
 		// 成功：写入本地 Zone 表，供转发规则使用
 		localZone := models.Zone{
 			CFID:        zone.ID,
+			AccountID:   client.GetAccountID(),
 			Name:        zone.Name,
 			Status:      zone.Status,
 			NameServers: strings.Join(zone.NameServers, ","),
@@ -173,6 +178,9 @@ func (s *ImportScheduler) getRegistrarClient(registrarID uint) (registrarPkg.Reg
 	var registrar models.DomainRegistrar
 	if err := s.db.First(&registrar, registrarID).Error; err != nil {
 		return nil, err
+	}
+	if !registrar.IsActive {
+		return nil, fmt.Errorf("注册商已禁用")
 	}
 	client := registrarPkg.GetClient(registrar.Type, registrar.APIKey, registrar.APISecret)
 	if client == nil {

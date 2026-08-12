@@ -84,14 +84,14 @@ function ForwardRules() {
         await updateForwardRule(editingRule.id, {
           origin_port: values.origin_port,
           origin_host: values.origin_host || '',
-          enabled: values.enabled,
+          enabled: editingRule.enabled,
         })
         message.success('更新成功')
       } else {
         await createForwardRule({
           origin_port: values.origin_port,
           origin_host: values.origin_host || '',
-          enabled: values.enabled,
+          enabled: true,
         })
         message.success('创建成功')
       }
@@ -163,6 +163,12 @@ function ForwardRules() {
       title: '目标主机',
       dataIndex: 'origin_host',
       key: 'origin_host',
+      render: (text: string) => text || <Text type="secondary">-</Text>,
+    },
+    {
+      title: '创建者',
+      dataIndex: 'username',
+      key: 'username',
       render: (text: string) => text || <Text type="secondary">-</Text>,
     },
     {
@@ -271,7 +277,7 @@ function ForwardRules() {
             tooltip="支持 IPv4（A 记录）、IPv6（AAAA 记录）或域名（CNAME 记录）"
             rules={[{ required: true, message: '请输入目标地址' }]}
           >
-            <Input placeholder="例如: 192.168.1.1 或 example.com" disabled={!!editingRule} />
+            <Input placeholder="例如: 192.168.1.1 或 example.com" />
           </Form.Item>
           <Form.Item
             name="origin_port"
@@ -283,11 +289,7 @@ function ForwardRules() {
               max={65535}
               style={{ width: '100%' }}
               placeholder="例如: 8080"
-              disabled={!!editingRule}
             />
-          </Form.Item>
-          <Form.Item name="enabled" label="启用状态" valuePropName="checked">
-            <Switch checkedChildren="启用" unCheckedChildren="禁用" />
           </Form.Item>
         </Form>
       </Modal>

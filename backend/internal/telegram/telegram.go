@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -42,7 +43,19 @@ func (c *Client) SendMessage(text string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("telegram API error: %d", resp.StatusCode)
+		return fmt.Errorf("telegram API error: HTTP %d", resp.StatusCode)
+	}
+
+	// Telegram 错误也返回 HTTP 200，需解析 body 中的 ok 字段判断
+	var result struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("解析 telegram 响应失败: %w", err)
+	}
+	if !result.OK {
+		return fmt.Errorf("telegram API error: %s", result.Description)
 	}
 	return nil
 }
