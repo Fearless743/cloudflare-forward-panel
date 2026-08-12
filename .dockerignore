@@ -1,0 +1,27 @@
+# Git
+.git
+.gitignore
+
+# 文档
+*.md
+.github
+
+# 后端
+backend/data
+backend/bin
+backend/*.db
+backend/*.db-wal
+backend/*.db-shm
+
+# 前端
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# 环境变量（避免把本地密钥打进镜像）
+.env
+.env.local
+
+# 系统
+.DS_Store
+Thumbs.db

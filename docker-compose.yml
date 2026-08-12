@@ -1,0 +1,15 @@
+services:
+  cf-panel:
+    image: ghcr.io/fearless743/cloudflare-forward-panel:latest
+    container_name: cf-panel
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # 数据库文件路径（容器内路径，已挂载到本地持久化目录）
+      DB_PATH: /app/data/cloudflare.db
+      # 服务监听端口
+      SERVER_PORT: "8080"
+    volumes:
+      # 持久化 SQLite 数据库，避免容器重建丢数据
+      - ./data:/app/data

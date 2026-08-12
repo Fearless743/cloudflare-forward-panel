@@ -4,6 +4,9 @@ vendor/
 
 # 构建产物
 dist/
+!backend/cmd/server/frontend/
+!backend/cmd/server/frontend/dist/
+!backend/cmd/server/frontend/dist/index.html
 *.exe
 *.dll
 *.so
