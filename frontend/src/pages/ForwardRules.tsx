@@ -143,9 +143,19 @@ function ForwardRules() {
 
   // 按域名分组统计
   const zoneStats: Record<string, number> = rules.reduce((acc, rule) => {
-    acc[rule.zone_name] = (acc[rule.zone_name] || 0) + 1
+    // 按端口去重：同端口多目标共享一条 CF Origin Rule，只计为 1
+    const key = `${rule.zone_name}:${rule.origin_port}`
+    if (!acc[key]) {
+      acc[key] = 1
+    }
     return acc
   }, {} as Record<string, number>)
+  // 按域名汇总端口数
+  const zonePortCounts: Record<string, number> = {}
+  Object.entries(zoneStats).forEach(([key]) => {
+    const zoneName = key.split(':')[0]
+    zonePortCounts[zoneName] = (zonePortCounts[zoneName] || 0) + 1
+  })
 
   const columns = [
     {
@@ -223,7 +233,7 @@ function ForwardRules() {
         message={
           <span>
             每个域名最多支持 <strong>10</strong> 条转发规则。
-            当前已有 <strong>{Object.keys(zoneStats).length}</strong> 个域名，共 <strong>{rules.length}</strong> 条规则。
+            当前已有 <strong>{Object.keys(zonePortCounts).length}</strong> 个域名，共 <strong>{rules.length}</strong> 条规则。
             创建规则时会自动将 SSL/TLS 设置为 Full 模式。
           </span>
         }
@@ -233,11 +243,11 @@ function ForwardRules() {
       />
 
       {/* 域名使用统计 */}
-      {Object.keys(zoneStats).length > 0 && (
+      {Object.keys(zonePortCounts).length > 0 && (
         <div style={{ marginBottom: 16 }}>
-          <Text type="secondary">各域名规则使用情况：</Text>
+          <Text type="secondary">各域名端口使用情况：</Text>
           <Space style={{ marginTop: 8 }} wrap>
-            {Object.entries(zoneStats).map(([name, count]) => {
+            {Object.entries(zonePortCounts).map(([name, count]) => {
               // 获取该域名对应的 zone_id
               const zoneRule = rules.find(r => r.zone_name === name)
               return (
