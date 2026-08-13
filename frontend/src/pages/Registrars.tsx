@@ -28,6 +28,8 @@ function Registrars() {
   // 从注册商拉取的待选域名
   const [domains, setDomains] = useState<AvailableDomain[]>([])
   const [domainsLoading, setDomainsLoading] = useState(false)
+  const [deletingId, setDeletingId] = useState<number | null>(null)
+  const [deletingDomainId, setDeletingDomainId] = useState<number | null>(null)
 
   const fetchRegistrars = async () => {
     setLoading(true)
@@ -63,6 +65,8 @@ function Registrars() {
   }
 
   const handleDelete = async (id: number) => {
+    if (deletingId !== null) return
+    setDeletingId(id)
     try {
       await deleteRegistrar(id)
       message.success('删除成功')
@@ -70,6 +74,8 @@ function Registrars() {
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : '删除失败'
       message.error(errorMessage)
+    } finally {
+      setDeletingId(null)
     }
   }
 
@@ -145,7 +151,8 @@ function Registrars() {
   }
 
   const handleDeleteDomain = async (domain: RegistrarDomain) => {
-    if (!currentRegistrar) return
+    if (!currentRegistrar || deletingDomainId !== null) return
+    setDeletingDomainId(domain.id)
     try {
       await deleteRegistrarDomain(currentRegistrar.id, domain.id)
       message.success('删除成功')
@@ -153,6 +160,8 @@ function Registrars() {
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : '删除失败'
       message.error(errorMessage)
+    } finally {
+      setDeletingDomainId(null)
     }
   }
 
@@ -277,8 +286,9 @@ function Registrars() {
           <Button type="link" size="small" icon={<EditOutlined />} onClick={() => handleEdit(record)}>
             编辑
           </Button>
-          <Popconfirm title="确定删除此注册商？" onConfirm={() => handleDelete(record.id)}>
-            <Button type="link" size="small" danger icon={<DeleteOutlined />}>
+          <Popconfirm title="确定删除此注册商？" onConfirm={() => handleDelete(record.id)}
+            okButtonProps={{ loading: deletingId === record.id, danger: true }}>
+            <Button type="link" size="small" danger icon={<DeleteOutlined />} disabled={deletingId !== null}>
               删除
             </Button>
           </Popconfirm>
@@ -332,8 +342,9 @@ function Registrars() {
       title: '操作',
       key: 'actions',
       render: (_: unknown, record: RegistrarDomain) => (
-        <Popconfirm title="确定删除此域名记录？" onConfirm={() => handleDeleteDomain(record)}>
-          <Button type="link" size="small" danger icon={<DeleteOutlined />}>
+        <Popconfirm title="确定删除此域名记录？" onConfirm={() => handleDeleteDomain(record)}
+            okButtonProps={{ loading: deletingDomainId === record.id, danger: true }}>
+          <Button type="link" size="small" danger icon={<DeleteOutlined />} disabled={deletingDomainId !== null}>
             删除
           </Button>
         </Popconfirm>

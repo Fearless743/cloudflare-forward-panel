@@ -209,7 +209,7 @@ func (h *Handler) migratePortGroup(client *cfclient.Client, zones []models.Zone,
 			},
 		},
 	}
-	created, err := h.ensureOriginRuleset(client, bestZone.CFID, ruleset)
+	created, _, err := h.ensureOriginRuleset(client, bestZone.CFID, ruleset)
 	if err != nil {
 		// 回滚已创建的 DNS
 		for _, he := range hosts {
@@ -773,10 +773,26 @@ func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.db.Where("id = ?", userID).Delete(&models.User{}).Error; err != nil {
+	// 检查该用户是否有转发规则，阻止删除避免产生孤儿规则
+	var ruleCount int64
+	h.db.Model(&models.ForwardRule{}).Where("user_id = ?", userID).Count(&ruleCount)
+	if ruleCount > 0 {
+		respondError(w, http.StatusBadRequest,
+			fmt.Sprintf("该用户下有 %d 条转发规则，请先删除所有规则后再删除用户", ruleCount))
+		return
+	}
+
+	result := h.db.Where("id = ?", userID).Delete(&models.User{})
+	if result.Error != nil {
 		respondError(w, http.StatusInternalServerError, "删除失败")
 		return
 	}
+	if result.RowsAffected == 0 {
+		respondError(w, http.StatusNotFound, "用户不存在")
+		return
+	}
+
+	log.Printf("[Admin] 管理员 %s(role=%s) 删除了用户 ID %d", claims.Username, claims.Role, userID)
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -935,15 +951,38 @@ func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.db.Where("id = ?", accountID).Delete(&models.CFAccount{}).Error; err != nil {
+	claims := auth.GetUserFromContext(r)
+
+	// 检查该账号下是否有转发规则，阻止删除避免产生无法清理的孤儿规则
+	var ruleCount int64
+	h.db.Model(&models.ForwardRule{}).Where("account_id = ?", accountID).Count(&ruleCount)
+	if ruleCount > 0 {
+		respondError(w, http.StatusBadRequest,
+			fmt.Sprintf("该账号下有 %d 条转发规则，请先删除所有规则后再删除账号", ruleCount))
+		return
+	}
+
+	// 事务保护：删除账号 + 删除 Zone 镜像原子完成
+	tx := h.db.Begin()
+
+	if err := tx.Where("id = ?", accountID).Delete(&models.CFAccount{}).Error; err != nil {
+		tx.Rollback()
 		respondError(w, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
 
 	// 删除账号时同步删除其本地 Zone 镜像（避免转发规则创建时选中已删除账号的域名）
-	h.db.Where("account_id = ?", accountID).Delete(&models.Zone{})
+	if err := tx.Where("account_id = ?", accountID).Delete(&models.Zone{}).Error; err != nil {
+		tx.Rollback()
+		respondError(w, http.StatusInternalServerError, "删除 Zone 镜像失败: "+err.Error())
+		return
+	}
+
+	tx.Commit()
 
 	h.manager.ReloadAccounts()
+
+	log.Printf("[Admin] 管理员 %s(role=%s) 删除了 CF 账号 %d", claims.Username, claims.Role, accountID)
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -1146,6 +1185,15 @@ func (h *Handler) deleteDNSRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 检查该 DNS 记录是否被转发规则引用，阻止误删
+	var ruleCount int64
+	h.db.Model(&models.ForwardRule{}).Where("zone_id = ? AND dns_record_id = ?", zoneID, recordID).Count(&ruleCount)
+	if ruleCount > 0 {
+		respondError(w, http.StatusBadRequest,
+			fmt.Sprintf("该 DNS 记录被 %d 条转发规则引用，请先删除相关规则后再删除 DNS 记录", ruleCount))
+		return
+	}
+
 	if err := client.DeleteDNSRecord(zoneID, recordID); err != nil {
 		respondError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1328,6 +1376,7 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 		// 按所有「启用行」统一重建共享规则表达式（禁用行不进入表达式）
 		client, err := h.getCFClientForAccount(existing.AccountID)
 		if err != nil {
+			h.db.Delete(&newRow)
 			respondError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -1460,7 +1509,7 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	created, err := h.ensureOriginRuleset(client, bestZone.CFID, ruleset)
+	created, isNew, err := h.ensureOriginRuleset(client, bestZone.CFID, ruleset)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "创建 Cloudflare 规则失败: "+err.Error())
 		return
@@ -1478,7 +1527,11 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 	}
 	createdDNS, err := client.CreateDNSRecord(bestZone.CFID, dnsRecord)
 	if err != nil {
-		client.DeleteOriginRuleset(bestZone.CFID, created.ID)
+		// 仅当本次新建了 ruleset 时才回滚删除；合并路径下 created.ID 是共享 ruleset，
+		// 删除会连带清掉该 Zone 下其他端口的转发规则。
+		if isNew {
+			client.DeleteOriginRuleset(bestZone.CFID, created.ID)
+		}
 		respondError(w, http.StatusInternalServerError, "创建 DNS 记录失败: "+err.Error())
 		return
 	}
@@ -1544,52 +1597,55 @@ func (h *Handler) addHostnameToRule(rule *models.ForwardRule, originHost string)
 
 // removeRuleFromRuleset 从共享 ruleset 中移除指定 rule（CF 侧），保留 ruleset 本身。
 // 是否删除整个 ruleset 由调用方基于「该 ruleset 是否还有其他本地行引用」决定。
-func (h *Handler) removeRuleFromRuleset(client *cfclient.Client, rule *models.ForwardRule) {
+func (h *Handler) removeRuleFromRuleset(client *cfclient.Client, rule *models.ForwardRule) error {
 	if rule.CFRuleSetID == "" {
-		return
+		return nil
 	}
 	full, err := client.GetOriginRuleset(rule.ZoneID, rule.CFRuleSetID)
 	if err != nil {
 		if strings.Contains(err.Error(), "[10001]") {
-			return // ruleset 已不存在
+			return nil // ruleset 已不存在
 		}
-		log.Printf("[ForwardRule] 获取 ruleset %s 失败: %v", rule.CFRuleSetID, err)
-		return
+		return fmt.Errorf("获取 ruleset %s 失败: %w", rule.CFRuleSetID, err)
 	}
 
 	idx := findRuleIndex(full.Rules, rule.CFRuleID)
 	if idx == -1 {
 		// 目标 rule 在 CF 侧已不存在（对账后仍未恢复）：无需操作
-		return
+		return nil
 	}
 
 	// CF 侧只剩这一条 rule，但本地仍引用该 ruleset（数据不一致）：
 	// 保守处理，不删除 ruleset（避免其他本地行失效），交由对账修复。
 	if len(full.Rules) <= 1 {
 		log.Printf("[ForwardRule] ruleset %s 仅剩一条 rule 但本地仍引用，跳过删除", rule.CFRuleSetID)
-		return
+		return nil
 	}
 
 	full.Rules = append(full.Rules[:idx], full.Rules[idx+1:]...)
 	if _, err := client.UpdateOriginRuleset(rule.ZoneID, rule.CFRuleSetID, full); err != nil {
-		log.Printf("[ForwardRule] 更新 ruleset %s 失败: %v", rule.CFRuleSetID, err)
+		return fmt.Errorf("更新 ruleset %s 失败: %w", rule.CFRuleSetID, err)
 	}
+	return nil
 }
 
 // deleteRuleset 删除整个 ruleset（仅当没有其他本地行引用该 ruleset 时由调用方调用）。
-func (h *Handler) deleteRuleset(client *cfclient.Client, rule *models.ForwardRule) {
+func (h *Handler) deleteRuleset(client *cfclient.Client, rule *models.ForwardRule) error {
 	if rule.CFRuleSetID == "" {
-		return
+		return nil
 	}
 	if err := client.DeleteOriginRuleset(rule.ZoneID, rule.CFRuleSetID); err != nil {
 		if strings.Contains(err.Error(), "[10001]") {
-			return // 已不存在，无需处理
+			return nil // 已不存在，无需处理
 		}
-		log.Printf("[ForwardRule] 删除 ruleset %s 失败: %v", rule.CFRuleSetID, err)
+		return fmt.Errorf("删除 ruleset %s 失败: %w", rule.CFRuleSetID, err)
 	}
+	return nil
 }
 
 // removeHostnameFromRule 从共享的 Origin Rule 表达式中移除指定主机名。
+// 注意：只收集剩余行中启用（r.Enabled）的 hostname，与 syncRuleExpression 保持一致。
+// 禁用目标的 hostname 不应进入表达式，避免误将已禁用的转发重新激活。
 func (h *Handler) removeHostnameFromRule(client *cfclient.Client, rule *models.ForwardRule) error {
 	// 剩余仍引用该 CF 规则的行（不含当前行）
 	var remaining []models.ForwardRule
@@ -1602,7 +1658,9 @@ func (h *Handler) removeHostnameFromRule(client *cfclient.Client, rule *models.F
 
 	hosts := make([]string, 0, len(remaining))
 	for _, r := range remaining {
-		hosts = append(hosts, r.Hostname)
+		if r.Enabled {
+			hosts = append(hosts, r.Hostname)
+		}
 	}
 
 	full, err := client.GetOriginRuleset(rule.ZoneID, rule.CFRuleSetID)
@@ -1708,7 +1766,7 @@ func (h *Handler) updateForwardRule(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
-			_ = client.DeleteDNSRecord(localRule.ZoneID, localRule.DNSRecordID)
+			oldDNSRecordID := localRule.DNSRecordID
 			newRecord := &cfclient.DNSRecord{
 				ZoneID:  localRule.ZoneID,
 				Name:    localRule.Hostname,
@@ -1722,6 +1780,11 @@ func (h *Handler) updateForwardRule(w http.ResponseWriter, r *http.Request) {
 				respondError(w, http.StatusInternalServerError, "更新 DNS 记录失败: "+err.Error())
 				return
 			}
+			// 新记录创建成功后，再删除旧记录（失败仅日志，不影响新记录）
+			if err := client.DeleteDNSRecord(localRule.ZoneID, oldDNSRecordID); err != nil {
+				log.Printf("[ForwardRule] 删除旧 DNS 记录 %s 失败: %v", oldDNSRecordID, err)
+			}
+			localRule.DNSRecordID = createdDNS.ID
 			localRule.DNSRecordID = createdDNS.ID
 		}
 	}
@@ -1835,19 +1898,41 @@ func (h *Handler) deleteForwardRule(w http.ResponseWriter, r *http.Request) {
 		}
 	case setCount <= 1:
 		// 整个 ruleset 只有当前行引用：删除整个 ruleset
-		h.deleteRuleset(client, &localRule)
+		if err := h.deleteRuleset(client, &localRule); err != nil {
+			if !forwardRuleMissingErr(err) {
+				respondError(w, http.StatusInternalServerError, "删除 CF ruleset 失败: "+err.Error())
+				return
+			}
+			log.Printf("[ForwardRule] 删除规则 %s 时 CF 侧 ruleset 已不存在，跳过", localRule.Hostname)
+		}
 	default:
 		// ruleset 还有其他规则被本地行引用（其他端口）：仅移除当前 rule，保留 ruleset
-		h.removeRuleFromRuleset(client, &localRule)
+		if err := h.removeRuleFromRuleset(client, &localRule); err != nil {
+			if !forwardRuleMissingErr(err) {
+				respondError(w, http.StatusInternalServerError, "从 CF ruleset 移除规则失败: "+err.Error())
+				return
+			}
+			log.Printf("[ForwardRule] 删除规则 %s 时 CF 侧规则已不存在，跳过", localRule.Hostname)
+		}
 	}
 
-	// 删除关联的 DNS 记录
+	// 删除关联的 DNS 记录（仅当 CF 侧删除成功后才执行，避免 DB 记录已删但 CF 资源残留）
 	if localRule.DNSRecordID != "" {
-		client.DeleteDNSRecord(localRule.ZoneID, localRule.DNSRecordID)
+		if err := client.DeleteDNSRecord(localRule.ZoneID, localRule.DNSRecordID); err != nil {
+			if !strings.Contains(err.Error(), "[10001]") {
+				log.Printf("[ForwardRule] 删除 DNS 记录 %s 失败: %v，本地记录保留", localRule.DNSRecordID, err)
+				respondError(w, http.StatusInternalServerError, "删除 DNS 记录失败，本地记录已保留: "+err.Error())
+				return
+			}
+			// DNS 记录已不存在，可以继续
+		}
 	}
 
 	// 删除本地记录
 	h.db.Delete(&localRule)
+
+	log.Printf("[ForwardRule] 管理员 %s(role=%s) 删除了转发规则 %s (%s:%d)",
+		claims.Username, claims.Role, localRule.Hostname, localRule.OriginHost, localRule.OriginPort)
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -2029,20 +2114,22 @@ func (h *Handler) findExistingRuleForPort(port int) *models.ForwardRule {
 
 // ensureOriginRuleset 创建 Origin Ruleset；若该 zone 已达 ruleset 数量上限（错误码 20217），
 // 则复用现有的 zone 级 http_request_origin ruleset，把新规则追加进去（合并方案）。
-func (h *Handler) ensureOriginRuleset(client *cfclient.Client, zoneID string, newRuleset *cfclient.OriginRuleset) (*cfclient.OriginRuleset, error) {
+// 返回 (ruleset, isNewlyCreated, error)：isNewlyCreated 为 true 表示本次新建了 ruleset，
+// 调用方在回滚时应仅对新建的 ruleset 执行删除，避免误删共享的已有 ruleset。
+func (h *Handler) ensureOriginRuleset(client *cfclient.Client, zoneID string, newRuleset *cfclient.OriginRuleset) (*cfclient.OriginRuleset, bool, error) {
 	created, err := client.CreateOriginRuleset(zoneID, newRuleset)
 	if err == nil {
-		return created, nil
+		return created, true, nil
 	}
 
-	// 只有“数量超限”才走合并；其他错误直接返回
+	// 只有"数量超限"才走合并；其他错误直接返回
 	if !strings.Contains(err.Error(), "[20217]") {
-		return nil, err
+		return nil, false, err
 	}
 
 	existingList, listErr := client.ListOriginRulesets(zoneID)
 	if listErr != nil {
-		return nil, fmt.Errorf("创建失败(%v)且无法列出已有 ruleset(%v)", err, listErr)
+		return nil, false, fmt.Errorf("创建失败(%v)且无法列出已有 ruleset(%v)", err, listErr)
 	}
 
 	// 选一个 zone 级（kind=zone）的 ruleset 来追加；没有则用返回的第一个
@@ -2056,7 +2143,7 @@ func (h *Handler) ensureOriginRuleset(client *cfclient.Client, zoneID string, ne
 	}
 	if target == nil {
 		if len(existingList) == 0 {
-			return nil, err
+			return nil, false, err
 		}
 		target = &existingList[0]
 	}
@@ -2064,14 +2151,14 @@ func (h *Handler) ensureOriginRuleset(client *cfclient.Client, zoneID string, ne
 	// 拉取完整 ruleset（含 rules），追加新规则后 PUT 更新
 	full, getErr := client.GetOriginRuleset(zoneID, target.ID)
 	if getErr != nil {
-		return nil, fmt.Errorf("创建失败(%v)且获取 ruleset %s 失败(%v)", err, target.ID, getErr)
+		return nil, false, fmt.Errorf("创建失败(%v)且获取 ruleset %s 失败(%v)", err, target.ID, getErr)
 	}
 	full.Rules = append(full.Rules, newRuleset.Rules...)
 	updated, updateErr := client.UpdateOriginRuleset(zoneID, full.ID, full)
 	if updateErr != nil {
-		return nil, fmt.Errorf("创建失败(%v)且合并到 ruleset %s 失败(%v)", err, full.ID, updateErr)
+		return nil, false, fmt.Errorf("创建失败(%v)且合并到 ruleset %s 失败(%v)", err, full.ID, updateErr)
 	}
-	return updated, nil
+	return updated, false, nil // isNewlyCreated=false，回滚时不能删除此共享 ruleset
 }
 
 // forwardRuleMissingErr 判断错误是否为「CF 规则/规则集不存在」类错误（资源已被 CF 侧删除）。
@@ -2256,13 +2343,14 @@ func (h *Handler) rebuildZoneRuleset(client *cfclient.Client, zoneID string, gro
 	if len(rules) == 0 {
 		return nil, fmt.Errorf("没有可重建的启用规则")
 	}
-	return h.ensureOriginRuleset(client, zoneID, &cfclient.OriginRuleset{
+	recreated, _, err := h.ensureOriginRuleset(client, zoneID, &cfclient.OriginRuleset{
 		Name:        "CF Panel Port Forwarding",
 		Description: "Port forwarding rules managed by CF Panel",
 		Kind:        "zone",
 		Phase:       "http_request_origin",
 		Rules:       rules,
 	})
+	return recreated, err
 }
 
 // updateGroupCFIDs 重建 ruleset 后，把组内所有本地行的 CF ID 更新为新值。
@@ -2352,16 +2440,48 @@ func isSubscriptionValid(user *models.User) bool {
 	return time.Now().Before(*user.Subscription)
 }
 
-// pauseExpiredSubscriptions 暂停过期用户的转发规则
+// pauseExpiredSubscriptions 暂停过期用户的转发规则，并同步到 CF 侧
 func (h *Handler) pauseExpiredSubscriptions() {
 	var users []models.User
 	h.db.Where("subscription IS NOT NULL AND subscription < ?", time.Now()).Find(&users)
 
 	for _, user := range users {
-		// 暂停该用户的所有转发规则
+		// 查找该用户所有已启用的转发规则
+		var rules []models.ForwardRule
+		h.db.Where("user_id = ? AND enabled = ?", user.ID, true).Find(&rules)
+
+		if len(rules) == 0 {
+			continue
+		}
+
+		// 先在 DB 中禁用
 		h.db.Model(&models.ForwardRule{}).
 			Where("user_id = ? AND enabled = ?", user.ID, true).
 			Update("enabled", false)
+
+		// 收集需要同步的 CF 规则对（同一端口共享同一 cf_rule 无需重复同步）
+		type cfRuleKey struct {
+			accountID  uint
+			cfRuleSetID string
+			cfRuleID   string
+		}
+		seen := make(map[cfRuleKey]bool)
+		for _, rule := range rules {
+			key := cfRuleKey{accountID: rule.AccountID, cfRuleSetID: rule.CFRuleSetID, cfRuleID: rule.CFRuleID}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			client, err := h.getCFClientForAccount(rule.AccountID)
+			if err != nil {
+				log.Printf("[Subscription] 获取账号 %d 客户端失败: %v，CF 侧规则未同步", rule.AccountID, err)
+				continue
+			}
+			if err := h.syncRuleExpression(client, &rule); err != nil {
+				log.Printf("[Subscription] 同步 CF 规则 %s/%s 失败: %v", rule.CFRuleSetID, rule.CFRuleID, err)
+			}
+		}
 	}
 }
 
@@ -2540,9 +2660,32 @@ func (h *Handler) deleteRegistrar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.db.Delete(&models.DomainRegistrar{}, registrarID).Error; err != nil {
+	var registrar models.DomainRegistrar
+	if err := h.db.First(&registrar, registrarID).Error; err != nil {
+		respondError(w, http.StatusNotFound, "注册商不存在")
+		return
+	}
+
+	// 检查该注册商下是否有域名任务，阻止删除避免产生孤儿队列记录
+	var domainCount int64
+	h.db.Model(&models.RegistrarDomain{}).Where("registrar_id = ?", registrarID).Count(&domainCount)
+	if domainCount > 0 {
+		respondError(w, http.StatusBadRequest,
+			fmt.Sprintf("该注册商下有 %d 个域名记录，请先删除所有域名记录后再删除注册商", domainCount))
+		return
+	}
+
+	tx := h.db.Begin()
+	if err := tx.Delete(&models.DomainRegistrar{}, registrarID).Error; err != nil {
+		tx.Rollback()
 		respondError(w, http.StatusInternalServerError, "删除注册商失败: "+err.Error())
 		return
+	}
+	tx.Commit()
+
+	claims := auth.GetUserFromContext(r)
+	if claims != nil {
+		log.Printf("[Admin] 管理员 %s(role=%s) 删除了注册商 %s", claims.Username, claims.Role, registrar.Name)
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
@@ -2661,6 +2804,22 @@ func (h *Handler) deleteRegistrarDomain(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		respondError(w, http.StatusBadRequest, "invalid domain ID")
 		return
+	}
+
+	// 先查询域名记录状态，processing 中的任务禁止删除（避免与调度器竞态）
+	var domain models.RegistrarDomain
+	if err := h.db.Where("id = ? AND registrar_id = ?", domainID, registrarID).First(&domain).Error; err != nil {
+		respondError(w, http.StatusNotFound, "域名记录不存在")
+		return
+	}
+	if domain.Status == "processing" {
+		respondError(w, http.StatusBadRequest, "该域名正在导入中，请稍后再试")
+		return
+	}
+
+	// 已成功导入的域名删除后，CF Zone 不会自动清理，需提醒用户
+	if domain.Status == "success" || domain.Status == "partial" {
+		log.Printf("[Registrar] 警告：删除已成功导入的域名 %s，CF Zone 仍保留在 Cloudflare 中，需手动清理", domain.Domain)
 	}
 
 	result := h.db.Where("id = ? AND registrar_id = ?", domainID, registrarID).Delete(&models.RegistrarDomain{})

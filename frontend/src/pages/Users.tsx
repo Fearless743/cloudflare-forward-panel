@@ -13,6 +13,7 @@ function Users() {
   const [modalOpen, setModalOpen] = useState(false)
   const [editingUser, setEditingUser] = useState<User | null>(null)
   const [form] = Form.useForm()
+  const [deletingId, setDeletingId] = useState<number | null>(null)
 
   const fetchUsers = async () => {
     setLoading(true)
@@ -49,6 +50,8 @@ function Users() {
   }
 
   const handleDelete = async (id: number) => {
+    if (deletingId !== null) return
+    setDeletingId(id)
     try {
       await deleteUser(id)
       message.success('删除成功')
@@ -56,6 +59,8 @@ function Users() {
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : '删除失败'
       message.error(errorMessage)
+    } finally {
+      setDeletingId(null)
     }
   }
 
@@ -157,8 +162,9 @@ function Users() {
           <Button type="link" size="small" icon={<EditOutlined />} onClick={() => handleEdit(record)}>
             编辑
           </Button>
-          <Popconfirm title="确定删除此用户？" onConfirm={() => handleDelete(record.id)}>
-            <Button type="link" size="small" danger icon={<DeleteOutlined />}>
+          <Popconfirm title="确定删除此用户？" onConfirm={() => handleDelete(record.id)}
+            okButtonProps={{ loading: deletingId === record.id, danger: true }}>
+            <Button type="link" size="small" danger icon={<DeleteOutlined />} disabled={deletingId !== null}>
               删除
             </Button>
           </Popconfirm>

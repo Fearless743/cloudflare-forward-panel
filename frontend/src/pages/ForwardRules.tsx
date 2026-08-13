@@ -19,6 +19,8 @@ function ForwardRules() {
   const [certLoading, setCertLoading] = useState(false)
   const [certificate, setCertificate] = useState<OriginCertificate | null>(null)
   const [selectedRule, setSelectedRule] = useState<ForwardRule | null>(null)
+  // 删除中的规则 ID，用于防重复提交
+  const [deletingId, setDeletingId] = useState<number | null>(null)
 
   const fetchData = async () => {
     setLoading(true)
@@ -55,6 +57,8 @@ function ForwardRules() {
   }
 
   const handleDelete = async (id: number) => {
+    if (deletingId !== null) return // 防止重复点击
+    setDeletingId(id)
     try {
       await deleteForwardRule(id)
       message.success('删除成功')
@@ -62,6 +66,8 @@ function ForwardRules() {
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : '删除失败'
       message.error(errorMessage)
+    } finally {
+      setDeletingId(null)
     }
   }
 
@@ -192,8 +198,9 @@ function ForwardRules() {
           <Button type="link" size="small" icon={<EditOutlined />} onClick={() => handleEdit(record)}>
             编辑
           </Button>
-          <Popconfirm title="确定删除此规则？" onConfirm={() => handleDelete(record.id)}>
-            <Button type="link" size="small" danger icon={<DeleteOutlined />}>
+          <Popconfirm title="确定删除此规则？" onConfirm={() => handleDelete(record.id)}
+            okButtonProps={{ loading: deletingId === record.id, danger: true }}>
+            <Button type="link" size="small" danger icon={<DeleteOutlined />} disabled={deletingId !== null}>
               删除
             </Button>
           </Popconfirm>

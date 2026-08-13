@@ -12,6 +12,7 @@ function Accounts() {
   const [modalOpen, setModalOpen] = useState(false)
   const [editingAccount, setEditingAccount] = useState<CFAccount | null>(null)
   const [form] = Form.useForm()
+  const [deletingId, setDeletingId] = useState<number | null>(null)
 
   const fetchAccounts = async () => {
     setLoading(true)
@@ -48,6 +49,8 @@ function Accounts() {
   }
 
   const handleDelete = async (id: number) => {
+    if (deletingId !== null) return
+    setDeletingId(id)
     try {
       await deleteAccount(id)
       message.success('删除成功')
@@ -55,6 +58,8 @@ function Accounts() {
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : '删除失败'
       message.error(errorMessage)
+    } finally {
+      setDeletingId(null)
     }
   }
 
@@ -175,8 +180,9 @@ function Accounts() {
           <Button type="link" size="small" icon={<EditOutlined />} onClick={() => handleEdit(record)}>
             编辑
           </Button>
-          <Popconfirm title="确定删除此账号？" onConfirm={() => handleDelete(record.id)}>
-            <Button type="link" size="small" danger icon={<DeleteOutlined />}>
+          <Popconfirm title="确定删除此账号？" onConfirm={() => handleDelete(record.id)}
+            okButtonProps={{ loading: deletingId === record.id, danger: true }}>
+            <Button type="link" size="small" danger icon={<DeleteOutlined />} disabled={deletingId !== null}>
               删除
             </Button>
           </Popconfirm>

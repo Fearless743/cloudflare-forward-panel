@@ -18,6 +18,7 @@ function DnsRecords() {
   const [modalOpen, setModalOpen] = useState(false)
   const [editingRecord, setEditingRecord] = useState<DNSRecord | null>(null)
   const [form] = Form.useForm()
+  const [deletingId, setDeletingId] = useState<string | null>(null)
 
   const fetchRecords = async () => {
     if (!zoneId) return
@@ -51,7 +52,8 @@ function DnsRecords() {
   }
 
   const handleDelete = async (recordId: string) => {
-    if (!zoneId) return
+    if (!zoneId || deletingId !== null) return
+    setDeletingId(recordId)
     try {
       await deleteDNSRecord(zoneId, recordId)
       message.success('删除成功')
@@ -59,6 +61,8 @@ function DnsRecords() {
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : '删除失败'
       message.error(errorMessage)
+    } finally {
+      setDeletingId(null)
     }
   }
 
@@ -124,8 +128,9 @@ function DnsRecords() {
           <Button type="link" size="small" icon={<EditOutlined />} onClick={() => handleEdit(record)}>
             编辑
           </Button>
-          <Popconfirm title="确定删除此记录？" onConfirm={() => handleDelete(record.id)}>
-            <Button type="link" size="small" danger icon={<DeleteOutlined />}>
+          <Popconfirm title="确定删除此记录？" onConfirm={() => handleDelete(record.id)}
+            okButtonProps={{ loading: deletingId === record.id, danger: true }}>
+            <Button type="link" size="small" danger icon={<DeleteOutlined />} disabled={deletingId !== null}>
               删除
             </Button>
           </Popconfirm>
