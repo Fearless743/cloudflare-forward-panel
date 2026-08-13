@@ -418,6 +418,20 @@ func (c *Client) UpdateSSLSettings(zoneID, value string) (*SSLSetting, error) {
 	return &setting, nil
 }
 
+// EnableWebSockets 开启域名的 WebSockets 支持（转发 TCP/WS 流量需要）
+func (c *Client) EnableWebSockets(zoneID string) error {
+	body := map[string]string{"value": "on"}
+	_, err := c.doRequest("PATCH", fmt.Sprintf("/zones/%s/settings/websockets", zoneID), body)
+	return err
+}
+
+// EnableGRPC 开启域名的 gRPC 支持（转发 gRPC 流量需要）
+func (c *Client) EnableGRPC(zoneID string) error {
+	body := map[string]string{"value": "on"}
+	_, err := c.doRequest("PATCH", fmt.Sprintf("/zones/%s/settings/grpc", zoneID), body)
+	return err
+}
+
 // Origin Certificate
 
 type OriginCertificateRequest struct {

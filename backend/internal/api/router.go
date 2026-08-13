@@ -223,6 +223,11 @@ func (h *Handler) migratePortGroup(client *cfclient.Client, zones []models.Zone,
 		newRuleID = created.Rules[len(created.Rules)-1].ID
 	}
 
+	// 目标 Zone 同样开启 SSL Full + WebSockets + gRPC（忽略错误）
+	_, _ = client.UpdateSSLSettings(bestZone.CFID, "full")
+	_ = client.EnableWebSockets(bestZone.CFID)
+	_ = client.EnableGRPC(bestZone.CFID)
+
 	// 更新本地规则行指向新账号/新 zone/新 CF 资源，并启用状态
 	for _, he := range hosts {
 		updates := map[string]interface{}{
@@ -1472,8 +1477,10 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 	}
 	h.db.Create(&localRule)
 
-	// 自动设置 SSL 为 Full 模式（忽略错误，不影响规则创建）
+	// 自动设置 SSL 为 Full 模式，并开启 WebSockets / gRPC（忽略错误，不影响规则创建）
 	_, _ = client.UpdateSSLSettings(bestZone.CFID, "full")
+	_ = client.EnableWebSockets(bestZone.CFID)
+	_ = client.EnableGRPC(bestZone.CFID)
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
