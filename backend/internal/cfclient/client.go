@@ -377,6 +377,31 @@ func (c *Client) DeleteOriginRuleset(zoneID, rulesetID string) error {
 	return err
 }
 
+// CountOriginRules 返回指定 zone 的 http_request_origin (kind=zone) 规则总数。
+// 一个 zone 可能有多个 zone 级 http_request_origin ruleset（rare），把每个 ruleset 内的规则数求和。
+// 统计的是 CF 侧真实存在的规则（含面板外手工创建、含禁用规则），
+// 供「按 CF 规则数最少选域名」的策略使用。
+func (c *Client) CountOriginRules(zoneID string) (int, error) {
+	rulesets, err := c.ListOriginRulesets(zoneID)
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for i := range rulesets {
+		rulesetID := rulesets[i].ID
+		if rulesetID == "" {
+			continue
+		}
+		full, err := c.GetOriginRuleset(zoneID, rulesetID)
+		if err != nil {
+			// 单个 ruleset 拉取失败不阻塞整体计数（该 zone 视为 0，调用方按最少选择仍可兜底）
+			continue
+		}
+		total += len(full.Rules)
+	}
+	return total, nil
+}
+
 // DisableOriginRule 停用 ruleset 中的所有规则（封禁账号时尽力停用 CF 侧规则）
 // 失败返回错误，调用方自行决定是否忽略
 func (c *Client) DisableOriginRule(zoneID, rulesetID string) error {

@@ -135,15 +135,21 @@ func (h *Handler) MigrateAccountRules(blockedAccountID uint) {
 
 // migratePortGroup 迁移某个端口下的所有目标到目标账号（重建 Origin Rule + DNS）。
 func (h *Handler) migratePortGroup(client *cfclient.Client, zones []models.Zone, account *models.CFAccount, port int, group []*models.ForwardRule) error {
-	// 挑选规则最少的 Zone
+	// 挑选规则最少的 Zone：以 CF 侧 http_request_origin 真实规则数为准（含外部手工规则）。
+	// 同端口多目标共享一条 CF 规则，本地行数会虚高，故不能用本地 ForwardRule 行数排名。
 	bestZone := zones[0]
-	minCount := int64(999999)
+	minCount := int(^uint(0) >> 1) // MaxInt
+	bestFound := false
 	for _, z := range zones {
-		var c int64
-		h.db.Model(&models.ForwardRule{}).Where("zone_id = ?", z.CFID).Count(&c)
-		if c < minCount {
-			minCount = c
+		count, err := client.CountOriginRules(z.CFID)
+		if err != nil {
+			log.Printf("[Migrate] 查询域名 %s 的 CF 规则数失败: %v，按 0 处理", z.Name, err)
+			count = 0
+		}
+		if !bestFound || count < minCount {
+			minCount = count
 			bestZone = z
+			bestFound = true
 		}
 	}
 
@@ -1439,23 +1445,57 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 选择域名策略：优先填满一个域名，避免规则在多个域名间均匀散开。
+	// 计数口径为 Cloudflare 侧 http_request_origin 的真实规则数（含面板外手工规则），
+	// 而非本地 ForwardRule 行数——同端口多目标共享一条 CF 规则，行数会虚高。
+	// 域名不设「已满」上限：始终在所有 zone 中挑选 CF 规则数最少的（作用于空域时规则更集中）。
 	type zoneCount struct {
 		zone  models.Zone
-		count int64
+		count int
 	}
-	var used []zoneCount
-	var empty models.Zone
-	hasEmpty := false
-	for _, zone := range availableZones {
-		var count int64
-		h.db.Model(&models.ForwardRule{}).Where("zone_id = ?", zone.CFID).Count(&count)
-		if count >= 10 {
-			continue // 已满，跳过
+	// 每个 zone 的规则数必须用该 zone 所属账号的 client 查询（跨账号 zone 不能共用轮询凭证）。
+	clientByAccount := make(map[uint]*cfclient.Client)
+	clientForZone := func(zone *models.Zone) (*cfclient.Client, error) {
+		if c, ok := clientByAccount[zone.AccountID]; ok {
+			return c, nil
 		}
-		if count > 0 {
-			used = append(used, zoneCount{zone: zone, count: count})
+		c, err := h.getCFClientForAccount(zone.AccountID)
+		if err != nil {
+			return nil, err
+		}
+		clientByAccount[zone.AccountID] = c
+		return c, nil
+	}
+
+	counted := make([]zoneCount, 0, len(availableZones))
+	for i := range availableZones {
+		zone := &availableZones[i]
+		client, err := clientForZone(zone)
+		if err != nil {
+			log.Printf("[ForwardRule] 获取域名 %s 所属账号客户端失败: %v，跳过", zone.Name, err)
+			continue
+		}
+		count, err := client.CountOriginRules(zone.CFID)
+		if err != nil {
+			log.Printf("[ForwardRule] 查询域名 %s 的 CF 规则数失败: %v，跳过", zone.Name, err)
+			continue
+		}
+		counted = append(counted, zoneCount{zone: *zone, count: count})
+	}
+	if len(counted) == 0 {
+		respondError(w, http.StatusBadRequest, "无法获取任何域名的规则数，请联系管理员排查 Cloudflare 账号状态")
+		return
+	}
+
+	// 填满策略：优先使用「已有规则（CF 侧 count>0）但最少」的域名；没有则用规则数为 0 的域名。
+	// 均不设上限。
+	var used []zoneCount
+	var empty zoneCount
+	hasEmpty := false
+	for _, zc := range counted {
+		if zc.count > 0 {
+			used = append(used, zc)
 		} else if !hasEmpty {
-			empty = zone
+			empty = zc
 			hasEmpty = true
 		}
 	}
@@ -1471,9 +1511,9 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 		}
 		bestZone = best.zone
 	case hasEmpty:
-		bestZone = empty
+		bestZone = empty.zone
 	default:
-		respondError(w, http.StatusBadRequest, "所有域名的转发规则已满，请联系管理员添加更多域名")
+		respondError(w, http.StatusBadRequest, "没有可用的域名，请先在域名管理中添加或解除账号封禁")
 		return
 	}
 
