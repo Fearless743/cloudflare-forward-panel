@@ -2148,12 +2148,45 @@ func (h *Handler) ensureOriginRuleset(client *cfclient.Client, zoneID string, ne
 		target = &existingList[0]
 	}
 
-	// 拉取完整 ruleset（含 rules），追加新规则后 PUT 更新
+	// 拉取完整 ruleset（含 rules），检查目标端口是否已存在规则
+	// 若已存在，更新其表达式合并 hostname，而非追加重复规则
 	full, getErr := client.GetOriginRuleset(zoneID, target.ID)
 	if getErr != nil {
 		return nil, false, fmt.Errorf("创建失败(%v)且获取 ruleset %s 失败(%v)", err, target.ID, getErr)
 	}
-	full.Rules = append(full.Rules, newRuleset.Rules...)
+	for i := range newRuleset.Rules {
+		newRule := &newRuleset.Rules[i]
+		merged := false
+		if newRule.ActionParameters != nil && newRule.ActionParameters.Origin != nil {
+			newPort := newRule.ActionParameters.Origin.Port
+			for j := range full.Rules {
+				existing := &full.Rules[j]
+				if existing.ActionParameters != nil && existing.ActionParameters.Origin != nil &&
+					existing.ActionParameters.Origin.Port == newPort {
+					existingHosts := parseHostnameList(existing.Expression)
+					newHosts := parseHostnameList(newRule.Expression)
+					mergedSet := make(map[string]bool, len(existingHosts)+len(newHosts))
+					for _, h := range existingHosts {
+						mergedSet[h] = true
+					}
+					for _, h := range newHosts {
+						mergedSet[h] = true
+					}
+					mergedList := make([]string, 0, len(mergedSet))
+					for h := range mergedSet {
+						mergedList = append(mergedList, h)
+					}
+					existing.Expression = buildHostExpression(mergedList)
+					existing.Enabled = existing.Enabled || newRule.Enabled
+					merged = true
+					break
+				}
+			}
+		}
+		if !merged {
+			full.Rules = append(full.Rules, *newRule)
+		}
+	}
 	updated, updateErr := client.UpdateOriginRuleset(zoneID, full.ID, full)
 	if updateErr != nil {
 		return nil, false, fmt.Errorf("创建失败(%v)且合并到 ruleset %s 失败(%v)", err, full.ID, updateErr)
@@ -2264,33 +2297,72 @@ func (h *Handler) reconcileZoneForwardRules(client *cfclient.Client, zoneID stri
 			if findRuleIndex(full.Rules, g.rows[0].CFRuleID) != -1 {
 				continue
 			}
-			// 该 rule 丢失：追加回 ruleset
-			hosts := enabledHosts(g.rows)
-			if len(hosts) == 0 {
-				continue
-			}
-			full.Rules = append(full.Rules, cfclient.OriginRule{
-				Description: fmt.Sprintf("Forward to port %d", g.port),
-				Expression:  buildHostExpression(hosts),
-				Action:      "route",
-				ActionParameters: &cfclient.ActionParams{
-					Origin: &cfclient.OriginParams{Port: g.port},
-				},
-				Enabled: true,
-			})
-			updated, updateErr := client.UpdateOriginRuleset(zoneID, full.ID, full)
-			if updateErr != nil {
-				log.Printf("[ForwardRule] 补回缺失 rule 失败 (%s): %v", full.ID, updateErr)
-				continue
-			}
-			newRuleID := ""
-			if len(updated.Rules) > 0 {
-				newRuleID = updated.Rules[len(updated.Rules)-1].ID
-			}
-			for _, r := range g.rows {
-				h.db.Model(r).Update("cf_rule_id", newRuleID)
-			}
-			fixed += len(g.rows)
+				// 该 rule 丢失：先在 ruleset 中按端口查找，避免创建重复规则
+				hosts := enabledHosts(g.rows)
+				if len(hosts) == 0 {
+					continue
+				}
+				existingIdx := -1
+				for j := range full.Rules {
+					r := &full.Rules[j]
+					if r.ActionParameters != nil && r.ActionParameters.Origin != nil &&
+						r.ActionParameters.Origin.Port == g.port {
+						existingIdx = j
+						break
+					}
+				}
+				if existingIdx != -1 {
+					// 同端口规则已存在：合并新 hostname 到现有规则表达式
+					existing := &full.Rules[existingIdx]
+					existingHosts := parseHostnameList(existing.Expression)
+					mergedSet := make(map[string]bool, len(existingHosts)+len(hosts))
+					for _, h := range existingHosts {
+						mergedSet[h] = true
+					}
+					for _, h := range hosts {
+						mergedSet[h] = true
+					}
+					mergedList := make([]string, 0, len(mergedSet))
+					for h := range mergedSet {
+						mergedList = append(mergedList, h)
+					}
+					existing.Expression = buildHostExpression(mergedList)
+					existing.Enabled = true
+					_, updateErr := client.UpdateOriginRuleset(zoneID, full.ID, full)
+					if updateErr != nil {
+						log.Printf("[ForwardRule] 合并缺失 rule 到现有规则失败 (%s): %v", full.ID, updateErr)
+						continue
+					}
+					// 更新本地行的 cf_rule_id 指向现有规则的 ID
+					for _, r := range g.rows {
+						h.db.Model(r).Update("cf_rule_id", existing.ID)
+					}
+					fixed += len(g.rows)
+					continue
+				}
+				// ruleset 中无同端口规则：追加新规则
+				full.Rules = append(full.Rules, cfclient.OriginRule{
+					Description: fmt.Sprintf("Forward to port %d", g.port),
+					Expression:  buildHostExpression(hosts),
+					Action:      "route",
+					ActionParameters: &cfclient.ActionParams{
+						Origin: &cfclient.OriginParams{Port: g.port},
+					},
+					Enabled: true,
+				})
+				updated, updateErr := client.UpdateOriginRuleset(zoneID, full.ID, full)
+				if updateErr != nil {
+					log.Printf("[ForwardRule] 补回缺失 rule 失败 (%s): %v", full.ID, updateErr)
+					continue
+				}
+				newRuleID := ""
+				if len(updated.Rules) > 0 {
+					newRuleID = updated.Rules[len(updated.Rules)-1].ID
+				}
+				for _, r := range g.rows {
+					h.db.Model(r).Update("cf_rule_id", newRuleID)
+				}
+				fixed += len(g.rows)
 		}
 	}
 
