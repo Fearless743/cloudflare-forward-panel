@@ -223,10 +223,8 @@ func (h *Handler) migratePortGroup(client *cfclient.Client, zones []models.Zone,
 		newRuleID = created.Rules[len(created.Rules)-1].ID
 	}
 
-	// 目标 Zone 同样开启 SSL Full + WebSockets + gRPC（忽略错误）
-	_, _ = client.UpdateSSLSettings(bestZone.CFID, "full")
-	_ = client.EnableWebSockets(bestZone.CFID)
-	_ = client.EnableGRPC(bestZone.CFID)
+	// 目标 Zone 同样开启转发所需设置（SSL Full + WebSockets + gRPC，忽略错误）
+	enableZoneForwardingSettings(client, bestZone.CFID)
 
 	// 更新本地规则行指向新账号/新 zone/新 CF 资源，并启用状态
 	for _, he := range hosts {
@@ -1260,6 +1258,14 @@ func (h *Handler) listForwardRules(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// enableZoneForwardingSettings 开启转发所需的 Zone 设置：SSL Full、WebSockets、gRPC。
+// 均为幂等操作，忽略错误（不阻断规则创建）。
+func enableZoneForwardingSettings(client *cfclient.Client, zoneID string) {
+	_, _ = client.UpdateSSLSettings(zoneID, "full")
+	_ = client.EnableWebSockets(zoneID)
+	_ = client.EnableGRPC(zoneID)
+}
+
 func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 	// 获取当前用户
 	claims := auth.GetUserFromContext(r)
@@ -1326,12 +1332,30 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.syncRuleExpression(client, &newRow); err != nil {
-			// 同步失败：删除刚插入的本地行与 DNS 记录
-			h.db.Delete(&newRow)
-			_ = client.DeleteDNSRecord(newRow.ZoneID, newRow.DNSRecordID)
-			respondError(w, http.StatusInternalServerError, err.Error())
-			return
+			if !forwardRuleMissingErr(err) {
+				// 同步失败：删除刚插入的本地行与 DNS 记录
+				h.db.Delete(&newRow)
+				_ = client.DeleteDNSRecord(newRow.ZoneID, newRow.DNSRecordID)
+				respondError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			// CF 侧规则丢失：全量对账补全后重试
+			if _, rerr := h.reconcileZoneForwardRules(client, newRow.ZoneID); rerr != nil {
+				h.db.Delete(&newRow)
+				_ = client.DeleteDNSRecord(newRow.ZoneID, newRow.DNSRecordID)
+				respondError(w, http.StatusInternalServerError, "自动修复规则失败: "+rerr.Error())
+				return
+			}
+			if err := h.syncRuleExpression(client, &newRow); err != nil {
+				h.db.Delete(&newRow)
+				_ = client.DeleteDNSRecord(newRow.ZoneID, newRow.DNSRecordID)
+				respondError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
 		}
+
+		// 复用端口也要确保 Zone 已开启转发所需设置（旧规则/旧数据可能未开过）
+		enableZoneForwardingSettings(client, existing.ZoneID)
 
 		respondJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
@@ -1477,10 +1501,8 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 	}
 	h.db.Create(&localRule)
 
-	// 自动设置 SSL 为 Full 模式，并开启 WebSockets / gRPC（忽略错误，不影响规则创建）
-	_, _ = client.UpdateSSLSettings(bestZone.CFID, "full")
-	_ = client.EnableWebSockets(bestZone.CFID)
-	_ = client.EnableGRPC(bestZone.CFID)
+	// 自动开启转发所需设置（SSL Full + WebSockets + gRPC，忽略错误，不影响规则创建）
+	enableZoneForwardingSettings(client, bestZone.CFID)
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -1520,9 +1542,8 @@ func (h *Handler) addHostnameToRule(rule *models.ForwardRule, originHost string)
 	return hostname, createdDNS.ID, nil
 }
 
-// removeRuleFromRuleset 从共享 ruleset 中删除指定 rule（CF 侧）。
-// 若 ruleset 里只剩这一条 rule，则删除整个 ruleset；否则仅移除该条 rule。
-// 用于「每个端口一条 rule、同 zone 共享一个 ruleset」场景下删除某端口时。
+// removeRuleFromRuleset 从共享 ruleset 中移除指定 rule（CF 侧），保留 ruleset 本身。
+// 是否删除整个 ruleset 由调用方基于「该 ruleset 是否还有其他本地行引用」决定。
 func (h *Handler) removeRuleFromRuleset(client *cfclient.Client, rule *models.ForwardRule) {
 	if rule.CFRuleSetID == "" {
 		return
@@ -1536,22 +1557,35 @@ func (h *Handler) removeRuleFromRuleset(client *cfclient.Client, rule *models.Fo
 		return
 	}
 
-	// 若本规则已是该 ruleset 唯一 rule（或找不到 CFRuleID），删除整个 ruleset
 	idx := findRuleIndex(full.Rules, rule.CFRuleID)
-	if len(full.Rules) <= 1 {
-		if err := client.DeleteOriginRuleset(rule.ZoneID, rule.CFRuleSetID); err != nil {
-			log.Printf("[ForwardRule] 删除 ruleset %s 失败: %v", rule.CFRuleSetID, err)
-		}
+	if idx == -1 {
+		// 目标 rule 在 CF 侧已不存在（对账后仍未恢复）：无需操作
 		return
 	}
 
-	// 多条 rule：移除目标 rule 后 PUT 更新
-	if idx == -1 {
+	// CF 侧只剩这一条 rule，但本地仍引用该 ruleset（数据不一致）：
+	// 保守处理，不删除 ruleset（避免其他本地行失效），交由对账修复。
+	if len(full.Rules) <= 1 {
+		log.Printf("[ForwardRule] ruleset %s 仅剩一条 rule 但本地仍引用，跳过删除", rule.CFRuleSetID)
 		return
 	}
+
 	full.Rules = append(full.Rules[:idx], full.Rules[idx+1:]...)
 	if _, err := client.UpdateOriginRuleset(rule.ZoneID, rule.CFRuleSetID, full); err != nil {
 		log.Printf("[ForwardRule] 更新 ruleset %s 失败: %v", rule.CFRuleSetID, err)
+	}
+}
+
+// deleteRuleset 删除整个 ruleset（仅当没有其他本地行引用该 ruleset 时由调用方调用）。
+func (h *Handler) deleteRuleset(client *cfclient.Client, rule *models.ForwardRule) {
+	if rule.CFRuleSetID == "" {
+		return
+	}
+	if err := client.DeleteOriginRuleset(rule.ZoneID, rule.CFRuleSetID); err != nil {
+		if strings.Contains(err.Error(), "[10001]") {
+			return // 已不存在，无需处理
+		}
+		log.Printf("[ForwardRule] 删除 ruleset %s 失败: %v", rule.CFRuleSetID, err)
 	}
 }
 
@@ -1579,7 +1613,13 @@ func (h *Handler) removeHostnameFromRule(client *cfclient.Client, rule *models.F
 	if idx == -1 {
 		return fmt.Errorf("Cloudflare 规则不存在")
 	}
-	full.Rules[idx].Expression = buildHostExpression(hosts)
+	if len(hosts) == 0 {
+		// 剩余行全部禁用：整条 rule 禁用（与 syncRuleExpression 一致，避免空表达式）
+		full.Rules[idx].Enabled = false
+	} else {
+		full.Rules[idx].Enabled = true
+		full.Rules[idx].Expression = buildHostExpression(hosts)
+	}
 	if _, err := client.UpdateOriginRuleset(rule.ZoneID, rule.CFRuleSetID, full); err != nil {
 		return fmt.Errorf("更新 Cloudflare 规则失败: %w", err)
 	}
@@ -1694,8 +1734,23 @@ func (h *Handler) updateForwardRule(w http.ResponseWriter, r *http.Request) {
 
 	// 编辑弹窗里的开关会改变 enabled：按「启用行」重建共享规则表达式
 	if err := h.syncRuleExpression(client, &localRule); err != nil {
-		respondError(w, http.StatusInternalServerError, err.Error())
-		return
+		if !forwardRuleMissingErr(err) {
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// CF 侧规则丢失：全量对账补全后重试
+		if _, rerr := h.reconcileZoneForwardRules(client, localRule.ZoneID); rerr != nil {
+			respondError(w, http.StatusInternalServerError, "自动修复规则失败: "+rerr.Error())
+			return
+		}
+		if err := h.db.Where("id = ?", ruleID).First(&localRule).Error; err != nil {
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := h.syncRuleExpression(client, &localRule); err != nil {
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
@@ -1746,21 +1801,44 @@ func (h *Handler) deleteForwardRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 统计还有多少本地行共享这条 CF 规则（含当前行）
+	// 删除前先对账：补齐 CF 侧缺失的规则/DNS、修复本地 CF ID 不一致，
+	// 保证下面的删除决策（是否删整个 ruleset）基于准确的数据，避免误删同端口共享规则。
+	// 对账幂等：规则完整时只做读取比对，开销可接受。
+	_, _ = h.reconcileZoneForwardRules(client, localRule.ZoneID)
+	if err := h.db.Where("id = ?", ruleID).First(&localRule).Error; err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// 统计引用同一 CF rule 的本地行数（同端口多目标共享一条 rule）
 	var sharedCount int64
 	h.db.Model(&models.ForwardRule{}).
 		Where("cf_rule_set_id = ? AND cf_rule_id = ?", localRule.CFRuleSetID, localRule.CFRuleID).
 		Count(&sharedCount)
 
-	if sharedCount <= 1 {
-		// 只有这一行引用该 CF 规则：从共享 ruleset 中删除该条 rule（ruleset 可能还含其他端口的规则）
-		h.removeRuleFromRuleset(client, &localRule)
-	} else {
-		// 多行共享：从 Origin Rule 表达式中移除本主机名
+	// 统计引用同一 ruleset 的本地行数（决定能否删除整个 ruleset）
+	var setCount int64
+	h.db.Model(&models.ForwardRule{}).
+		Where("cf_rule_set_id = ?", localRule.CFRuleSetID).
+		Count(&setCount)
+
+	switch {
+	case sharedCount > 1:
+		// 同 rule 多行共享（同端口复用）：从规则表达式移除本主机名，保留其余目标
 		if err := h.removeHostnameFromRule(client, &localRule); err != nil {
-			respondError(w, http.StatusInternalServerError, err.Error())
-			return
+			if !forwardRuleMissingErr(err) {
+				respondError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			// CF 侧规则已丢失：无需从 CF 删除，直接清理本地即可
+			log.Printf("[ForwardRule] 删除规则 %s 时 CF 侧已不存在，跳过 CF 侧清理", localRule.Hostname)
 		}
+	case setCount <= 1:
+		// 整个 ruleset 只有当前行引用：删除整个 ruleset
+		h.deleteRuleset(client, &localRule)
+	default:
+		// ruleset 还有其他规则被本地行引用（其他端口）：仅移除当前 rule，保留 ruleset
+		h.removeRuleFromRuleset(client, &localRule)
 	}
 
 	// 删除关联的 DNS 记录
@@ -1825,11 +1903,31 @@ func (h *Handler) toggleForwardRule(w http.ResponseWriter, r *http.Request) {
 	h.db.Save(&localRule)
 
 	if err := h.syncRuleExpression(client, &localRule); err != nil {
-		// 同步失败：回滚本地状态
-		localRule.Enabled = !newEnabled
-		h.db.Save(&localRule)
-		respondError(w, http.StatusInternalServerError, err.Error())
-		return
+		if !forwardRuleMissingErr(err) {
+			// 同步失败：回滚本地状态
+			localRule.Enabled = !newEnabled
+			h.db.Save(&localRule)
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// CF 侧规则丢失：全量对账补全后重试
+		if _, rerr := h.reconcileZoneForwardRules(client, localRule.ZoneID); rerr != nil {
+			localRule.Enabled = !newEnabled
+			h.db.Save(&localRule)
+			respondError(w, http.StatusInternalServerError, "自动修复规则失败: "+rerr.Error())
+			return
+		}
+		// 对账可能已更新本地行的 CF ID，重新读取后重试
+		if err := h.db.Where("id = ?", ruleID).First(&localRule).Error; err != nil {
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := h.syncRuleExpression(client, &localRule); err != nil {
+			localRule.Enabled = !newEnabled
+			h.db.Save(&localRule)
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
@@ -1976,84 +2074,218 @@ func (h *Handler) ensureOriginRuleset(client *cfclient.Client, zoneID string, ne
 	return updated, nil
 }
 
-// reconcileForwardRuleCloudflare 校验本地规则与 Cloudflare 侧资源是否一致，
-// 修复不一致（清理/重建 Origin Rule 与 DNS 记录）。返回 client 供后续操作复用。
-func (h *Handler) reconcileForwardRuleCloudflare(localRule *models.ForwardRule) (*cfclient.Client, error) {
-	client, err := h.getCFClientForAccount(localRule.AccountID)
+// forwardRuleMissingErr 判断错误是否为「CF 规则/规则集不存在」类错误（资源已被 CF 侧删除）。
+// 这类错误触发全量对账补全，而不是直接向用户报错。
+func forwardRuleMissingErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "[10001]") || strings.Contains(msg, "Cloudflare 规则不存在")
+}
+
+// ruleGroup 一组本地行共享同一条 CF rule（同端口多目标：各目标为一行，表达式含全部 hostname）。
+type ruleGroup struct {
+	rows []*models.ForwardRule
+	port int
+}
+
+// enabledHosts 返回组内启用行的 hostname 列表（禁用行不进入表达式）。
+func enabledHosts(rows []*models.ForwardRule) []string {
+	hosts := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.Enabled {
+			hosts = append(hosts, r.Hostname)
+		}
+	}
+	return hosts
+}
+
+// reconcileZoneForwardRules 对指定 Zone 做全量对账：把本地所有引用 CF 资源的转发规则
+// 与 Cloudflare 侧对齐，重建任何在 CF 侧丢失的 ruleset / rule / DNS 记录。
+// 同端口多目标共享一条 rule：整条 ruleset 丢失时按「rule-group」整体重建，
+// 单条 rule 丢失时追加回原 ruleset。返回被修复的规则数。
+func (h *Handler) reconcileZoneForwardRules(client *cfclient.Client, zoneID string) (int, error) {
+	// 1) 收集本地所有行（含禁用行，禁用行仍共享同一 CF rule）
+	var rows []models.ForwardRule
+	h.db.Where("zone_id = ?", zoneID).Order("id ASC").Find(&rows)
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	// 2) 拉取 CF 侧该 zone 全部 ruleset（含完整 rules）与 DNS 记录
+	existingList, err := client.ListOriginRulesets(zoneID)
 	if err != nil {
-		return nil, err
+		return 0, fmt.Errorf("列出 Cloudflare 规则失败: %w", err)
+	}
+	rulesetMap := make(map[string]*cfclient.OriginRuleset, len(existingList))
+	for i := range existingList {
+		rs := &existingList[i]
+		full, getErr := client.GetOriginRuleset(zoneID, rs.ID)
+		if getErr != nil {
+			continue // 单个 ruleset 拉取失败不阻塞整体对账
+		}
+		rulesetMap[full.ID] = full
 	}
 
-	// 1) Origin Rule 侧
-	if localRule.CFRuleSetID != "" {
-		if _, err := client.GetOriginRuleset(localRule.ZoneID, localRule.CFRuleSetID); err != nil {
-			if strings.Contains(err.Error(), "[10001]") {
-				// ruleset 不存在：重建
-				expression := fmt.Sprintf("(http.host eq %q)", localRule.Hostname)
-				recreated, createErr := h.ensureOriginRuleset(client, localRule.ZoneID, &cfclient.OriginRuleset{
-					Name:        "CF Panel Port Forwarding",
-					Description: "Port forwarding rules managed by CF Panel",
-					Kind:        "zone",
-					Phase:       "http_request_origin",
-					Rules: []cfclient.OriginRule{
-						{
-							Description: fmt.Sprintf("Forward %s to port %d", localRule.Hostname, localRule.OriginPort),
-							Expression:  expression,
-							Action:      "route",
-							ActionParameters: &cfclient.ActionParams{
-								Origin: &cfclient.OriginParams{Port: localRule.OriginPort},
-							},
-							Enabled: localRule.Enabled,
-						},
-					},
-				})
-				if createErr != nil {
-					return nil, fmt.Errorf("重建 Cloudflare 规则失败: %w", createErr)
-				}
-				localRule.CFRuleSetID = recreated.ID
-				if len(recreated.Rules) > 0 {
-					localRule.CFRuleID = recreated.Rules[len(recreated.Rules)-1].ID
-				}
-			} else {
-				return nil, fmt.Errorf("获取 Cloudflare 规则失败: %w", err)
-			}
+	dnsRecords, dnsErr := client.ListDNSRecords(zoneID, "")
+	dnsIDSet := make(map[string]bool, len(dnsRecords))
+	if dnsErr == nil {
+		for _, rec := range dnsRecords {
+			dnsIDSet[rec.ID] = true
 		}
 	}
 
-	// 2) DNS 侧
-	if localRule.DNSRecordID != "" {
-		// 用 DNS ID 查询记录是否存在（通过列表匹配）
-		records, listErr := client.ListDNSRecords(localRule.ZoneID, "")
-		if listErr == nil {
-			found := false
-			for _, rec := range records {
-				if rec.ID == localRule.DNSRecordID {
-					found = true
-					break
-				}
+	// 3) 按 ruleset -> rule 分组（同端口多目标共享一条 CF rule）
+	groupsBySet := make(map[string][]*ruleGroup)
+	groupByKey := make(map[string]*ruleGroup) // setID + "\x00" + ruleID
+	for i := range rows {
+		r := &rows[i]
+		if r.CFRuleSetID == "" || r.CFRuleID == "" {
+			continue // 无 CF 关联的旧数据，跳过
+		}
+		key := r.CFRuleSetID + "\x00" + r.CFRuleID
+		g, ok := groupByKey[key]
+		if !ok {
+			g = &ruleGroup{port: r.OriginPort}
+			groupByKey[key] = g
+			groupsBySet[r.CFRuleSetID] = append(groupsBySet[r.CFRuleSetID], g)
+		}
+		g.rows = append(g.rows, r)
+	}
+
+	fixed := 0
+
+	for setID, groups := range groupsBySet {
+		full, ok := rulesetMap[setID]
+		if !ok {
+			// 整个 ruleset 丢失：按 rule-group 整体重建（每条 CF rule 对应一个组）
+			recreated, createErr := h.rebuildZoneRuleset(client, zoneID, groups)
+			if createErr != nil {
+				log.Printf("[ForwardRule] 重建 ruleset %s 失败: %v", setID, createErr)
+				continue
 			}
-			if !found {
-				// DNS 记录不存在：重建
-				recordType := detectDNSRecordType(localRule.OriginHost)
-				newRecord := &cfclient.DNSRecord{
-					ZoneID:  localRule.ZoneID,
-					Name:    localRule.Hostname,
-					Type:    recordType,
-					Content: localRule.OriginHost,
-					TTL:     1,
-					Proxied: true,
-				}
-				createdDNS, createErr := client.CreateDNSRecord(localRule.ZoneID, newRecord)
-				if createErr != nil {
-					return nil, fmt.Errorf("重建 DNS 记录失败: %w", createErr)
-				}
-				localRule.DNSRecordID = createdDNS.ID
+			h.updateGroupCFIDs(groups, recreated)
+			for _, g := range groups {
+				fixed += len(g.rows)
 			}
+			continue
+		}
+
+		// ruleset 还在：逐条检查 rule 是否丢失
+		for _, g := range groups {
+			if findRuleIndex(full.Rules, g.rows[0].CFRuleID) != -1 {
+				continue
+			}
+			// 该 rule 丢失：追加回 ruleset
+			hosts := enabledHosts(g.rows)
+			if len(hosts) == 0 {
+				continue
+			}
+			full.Rules = append(full.Rules, cfclient.OriginRule{
+				Description: fmt.Sprintf("Forward to port %d", g.port),
+				Expression:  buildHostExpression(hosts),
+				Action:      "route",
+				ActionParameters: &cfclient.ActionParams{
+					Origin: &cfclient.OriginParams{Port: g.port},
+				},
+				Enabled: true,
+			})
+			updated, updateErr := client.UpdateOriginRuleset(zoneID, full.ID, full)
+			if updateErr != nil {
+				log.Printf("[ForwardRule] 补回缺失 rule 失败 (%s): %v", full.ID, updateErr)
+				continue
+			}
+			newRuleID := ""
+			if len(updated.Rules) > 0 {
+				newRuleID = updated.Rules[len(updated.Rules)-1].ID
+			}
+			for _, r := range g.rows {
+				h.db.Model(r).Update("cf_rule_id", newRuleID)
+			}
+			fixed += len(g.rows)
 		}
 	}
 
-	h.db.Save(localRule)
-	return client, nil
+	// 4) DNS 对账
+	for i := range rows {
+		r := &rows[i]
+		if r.DNSRecordID == "" || dnsIDSet[r.DNSRecordID] {
+			continue
+		}
+		created, createErr := client.CreateDNSRecord(zoneID, &cfclient.DNSRecord{
+			ZoneID:  zoneID,
+			Name:    r.Hostname,
+			Type:    detectDNSRecordType(r.OriginHost),
+			Content: r.OriginHost,
+			TTL:     1,
+			Proxied: true,
+		})
+		if createErr != nil {
+			log.Printf("[ForwardRule] 重建 DNS 记录失败 (%s): %v", r.Hostname, createErr)
+			continue
+		}
+		h.db.Model(r).Update("dns_record_id", created.ID)
+		fixed++
+	}
+
+	if fixed > 0 {
+		log.Printf("[ForwardRule] Zone %s 对账完成，修复 %d 项", zoneID, fixed)
+	}
+	return fixed, nil
+}
+
+// rebuildZoneRuleset 用本地 rule-group 重建一个丢失的 ruleset（每条 CF rule 对应一个组）。
+func (h *Handler) rebuildZoneRuleset(client *cfclient.Client, zoneID string, groups []*ruleGroup) (*cfclient.OriginRuleset, error) {
+	rules := make([]cfclient.OriginRule, 0, len(groups))
+	for _, g := range groups {
+		hosts := enabledHosts(g.rows)
+		if len(hosts) == 0 {
+			continue
+		}
+		rules = append(rules, cfclient.OriginRule{
+			Description: fmt.Sprintf("Forward to port %d", g.port),
+			Expression:  buildHostExpression(hosts),
+			Action:      "route",
+			ActionParameters: &cfclient.ActionParams{
+				Origin: &cfclient.OriginParams{Port: g.port},
+			},
+			Enabled: true,
+		})
+	}
+	if len(rules) == 0 {
+		return nil, fmt.Errorf("没有可重建的启用规则")
+	}
+	return h.ensureOriginRuleset(client, zoneID, &cfclient.OriginRuleset{
+		Name:        "CF Panel Port Forwarding",
+		Description: "Port forwarding rules managed by CF Panel",
+		Kind:        "zone",
+		Phase:       "http_request_origin",
+		Rules:       rules,
+	})
+}
+
+// updateGroupCFIDs 重建 ruleset 后，把组内所有本地行的 CF ID 更新为新值。
+// 新规则按目标端口映射到对应 rule-group。
+func (h *Handler) updateGroupCFIDs(groups []*ruleGroup, recreated *cfclient.OriginRuleset) {
+	ruleIDByPort := make(map[int]string, len(recreated.Rules))
+	for _, rule := range recreated.Rules {
+		if rule.ActionParameters != nil && rule.ActionParameters.Origin != nil {
+			ruleIDByPort[rule.ActionParameters.Origin.Port] = rule.ID
+		}
+	}
+	for _, g := range groups {
+		ruleID := ruleIDByPort[g.port]
+		if ruleID == "" && len(recreated.Rules) > 0 {
+			ruleID = recreated.Rules[len(recreated.Rules)-1].ID // 兜底
+		}
+		for _, r := range g.rows {
+			h.db.Model(r).Updates(map[string]interface{}{
+				"cf_rule_set_id": recreated.ID,
+				"cf_rule_id":     ruleID,
+			})
+		}
+	}
 }
 
 func parseQueryInt(r *http.Request, key string, fallback int) int {

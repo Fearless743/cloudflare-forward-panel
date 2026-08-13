@@ -167,6 +167,9 @@ func (s *ImportScheduler) processPending() {
 			log.Printf("[ImportScheduler] 写入本地 Zone 失败: %v", err)
 		}
 
+		// 新接入的 Zone 即开启转发所需设置（幂等，忽略错误）
+		enableZoneForwardingSettings(client, zone.ID)
+
 		s.finishTask(task, "success", "", client.GetAccountID())
 		// 记录已存在，避免同批次内重复
 		existingSet[domain] = true
