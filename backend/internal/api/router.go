@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -28,10 +29,19 @@ type Handler struct {
 	manager   *cfclient.Manager
 	config    *config.Config
 	scheduler *ImportScheduler
+
+	// analytics 内存缓存：key=zoneID:hostname:range，TTL 60s
+	analyticsMu    sync.RWMutex
+	analyticsCache map[string]*analyticsCacheEntry
 }
 
 func NewHandler(db *gorm.DB, manager *cfclient.Manager, cfg *config.Config) *Handler {
-	h := &Handler{db: db, manager: manager, config: cfg}
+	h := &Handler{
+		db:            db,
+		manager:       manager,
+		config:        cfg,
+		analyticsCache: make(map[string]*analyticsCacheEntry),
+	}
 	h.scheduler = NewImportScheduler(db, manager)
 	return h
 }
@@ -290,6 +300,7 @@ func (h *Handler) Router() *chi.Mux {
 				r.Put("/{ruleID}", h.updateForwardRule)
 				r.Delete("/{ruleID}", h.deleteForwardRule)
 				r.Post("/{ruleID}/toggle", h.toggleForwardRule)
+				r.Get("/{ruleID}/analytics", h.getRuleAnalytics)
 			})
 
 			// 以下均为管理员级功能
@@ -1320,6 +1331,233 @@ func (h *Handler) listForwardRules(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"result":  result,
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Analytics 流量统计
+
+const analyticsCacheTTL = 60 * time.Second
+
+// analyticsMetrics 规则流量统计指标
+type analyticsMetrics struct {
+	TotalRequests int64 `json:"total_requests"`
+	TotalBytes    int64 `json:"total_bytes"`
+	TotalVisits   int64 `json:"total_visits"`
+	UniqueIPs     int64 `json:"unique_ips"`
+}
+
+// analyticsPoint 一次时间桶的流量数据
+type analyticsPoint struct {
+	Time     string `json:"time"`
+	Requests int64  `json:"requests"`
+	Bytes    int64  `json:"bytes"`
+}
+
+// analyticsCacheEntry 内存缓存条目
+type analyticsCacheEntry struct {
+	metrics   analyticsMetrics
+	timeseries []analyticsPoint
+	expiresAt time.Time
+}
+
+// getRuleAnalytics 返回单条转发规则的流量统计（Cloudflare GraphQL Analytics API）。
+// range 参数: 24h / 7d / 30d，默认 24h，非法值返回 400。
+// 规则不存在返回 404；普通用户仅能查看自己的规则（管理员可见全部）。
+// CF API 失败时返回全零 metrics 并附带 error 字段（不阻塞前端展示），HTTP 200。
+func (h *Handler) getRuleAnalytics(w http.ResponseWriter, r *http.Request) {
+	claims := auth.GetUserFromContext(r)
+	if claims == nil {
+		respondError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+
+	ruleID := chi.URLParam(r, "ruleID")
+
+	var rule models.ForwardRule
+	if err := h.db.Where("id = ?", ruleID).First(&rule).Error; err != nil {
+		respondError(w, http.StatusNotFound, "规则不存在")
+		return
+	}
+
+	// 普通用户仅能查看自己的规则
+	if claims.Role != "admin" && rule.UserID != claims.UserID {
+		respondError(w, http.StatusForbidden, "无权查看该规则")
+		return
+	}
+
+	// 解析 range 参数
+	rangeStr := r.URL.Query().Get("range")
+	if rangeStr == "" {
+		rangeStr = "24h"
+	}
+	var dur time.Duration
+	switch rangeStr {
+	case "24h":
+		dur = 24 * time.Hour
+	case "7d":
+		dur = 7 * 24 * time.Hour
+	case "30d":
+		dur = 30 * 24 * time.Hour
+	default:
+		respondError(w, http.StatusBadRequest, "无效的 range 参数，可选 24h / 7d / 30d")
+		return
+	}
+
+	lt := time.Now().UTC()
+	geq := lt.Add(-dur)
+
+	// 缓存读写
+	key := fmt.Sprintf("%s:%s:%s", rule.ZoneID, rule.Hostname, rangeStr)
+
+	h.analyticsMu.RLock()
+	entry, exist := h.analyticsCache[key]
+	h.analyticsMu.RUnlock()
+	if exist && time.Now().Before(entry.expiresAt) {
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"data": map[string]interface{}{
+				"rule_id":    rule.ID,
+				"hostname":   rule.Hostname,
+				"zone_id":    rule.ZoneID,
+				"zone_name":  rule.ZoneName,
+				"range":      rangeStr,
+				"cached":     true,
+				"metrics":    entry.metrics,
+				"timeseries": entry.timeseries,
+			},
+		})
+		return
+	}
+
+	// 未命中缓存 → 查询 CF（同 zone 合并优化：一次 QueryZoneHTTPMetricsByZone，回填该 zone 所有 hostname 的缓存）
+	client, err := h.getCFClientForAccount(rule.AccountID)
+	if err != nil {
+		log.Printf("[Analytics] 获取 CF 客户端失败（规则 %d）: %v", rule.ID, err)
+		h.respondAnalyticsDegraded(w, &rule, rangeStr, "无可用 CF 账号: "+err.Error())
+		return
+	}
+
+	// 尝试 zone 级合并查询，回填该 zone 所有 hostname 的缓存
+	byHost, zoneErr := client.QueryZoneHTTPMetricsByZone(rule.ZoneID, geq, lt)
+	if zoneErr != nil {
+		log.Printf("[Analytics] 查询 zone 流量失败（规则 %d）: %v", rule.ID, zoneErr)
+		// 回退：单 hostname 查询
+		rows, singleErr := client.QueryZoneHTTPMetrics(rule.ZoneID, rule.Hostname, geq, lt)
+		if singleErr != nil {
+			log.Printf("[Analytics] 单 hostname 查询也失败（规则 %d）: %v", rule.ID, singleErr)
+			h.respondAnalyticsDegraded(w, &rule, rangeStr, "查询流量数据失败: "+singleErr.Error())
+			return
+		}
+		m, ts := aggregateAnalyticsRows(rows)
+		entry := &analyticsCacheEntry{metrics: m, timeseries: ts, expiresAt: time.Now().Add(analyticsCacheTTL)}
+		h.analyticsMu.Lock()
+		h.analyticsCache[key] = entry
+		h.analyticsMu.Unlock()
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"data": map[string]interface{}{
+				"rule_id":    rule.ID,
+				"hostname":   rule.Hostname,
+				"zone_id":    rule.ZoneID,
+				"zone_name":  rule.ZoneName,
+				"range":      rangeStr,
+				"cached":     false,
+				"metrics":    m,
+				"timeseries": ts,
+			},
+		})
+		return
+	}
+
+	// zone 查询成功 → 回填该 zone 所有 hostname 的缓存条目
+	h.seedZoneAnalyticsCache(rule.ZoneID, rangeStr, byHost)
+
+	// 返回当前规则 hostname 的汇总
+	rows := byHost[rule.Hostname]
+	m, ts := aggregateAnalyticsRows(rows)
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"rule_id":    rule.ID,
+			"hostname":   rule.Hostname,
+			"zone_id":    rule.ZoneID,
+			"zone_name":  rule.ZoneName,
+			"range":      rangeStr,
+			"cached":     false,
+			"metrics":    m,
+			"timeseries": ts,
+		},
+	})
+}
+
+// respondAnalyticsDegraded 返回 CF API 失败时的降级响应（全零 metrics + error 字段），HTTP 200。
+func (h *Handler) respondAnalyticsDegraded(w http.ResponseWriter, rule *models.ForwardRule, rangeStr, errMsg string) {
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"rule_id":    rule.ID,
+			"hostname":   rule.Hostname,
+			"zone_id":    rule.ZoneID,
+			"zone_name":  rule.ZoneName,
+			"range":      rangeStr,
+			"cached":     false,
+			"error":      errMsg,
+			"metrics":    analyticsMetrics{},
+			"timeseries": []analyticsPoint{},
+		},
+	})
+}
+
+// aggregateAnalyticsRows 汇总 CF 返回的聚合行 → metrics 全窗求和 + timeseries 按时间桶展开。
+func aggregateAnalyticsRows(rows []cfclient.ZoneHTTPMetrics) (analyticsMetrics, []analyticsPoint) {
+	m := analyticsMetrics{}
+	if len(rows) == 0 {
+		return m, []analyticsPoint{}
+	}
+	ts := make([]analyticsPoint, 0, len(rows))
+	for _, row := range rows {
+		m.TotalRequests += row.Sum.Requests
+		m.TotalBytes += row.Sum.EdgeResponseBytes
+		m.TotalVisits += row.Sum.Visits
+		m.UniqueIPs += row.Uniq.Uniques
+		ts = append(ts, analyticsPoint{
+			Time:     row.TimeKey(),
+			Requests: row.Sum.Requests,
+			Bytes:    row.Sum.EdgeResponseBytes,
+		})
+	}
+	return m, ts
+}
+
+// seedZoneAnalyticsCache 把一次 zone 级查询结果回填到该 zone 所有 hostname 的缓存条目
+// （含该 zone 内其他规则 hostname，即使无流量也写入零值条目，避免逐规则重复查询 CF）。
+func (h *Handler) seedZoneAnalyticsCache(zoneID, rangeStr string, byHost map[string][]cfclient.ZoneHTTPMetrics) {
+	// 从 DB 取该 zone 下所有 hostname
+	var rules []models.ForwardRule
+	h.db.Select("hostname").Where("zone_id = ?", zoneID).Find(&rules)
+
+	hosts := make(map[string]bool)
+	for _, r := range rules {
+		if r.Hostname != "" {
+			hosts[r.Hostname] = true
+		}
+	}
+	// 请求中已存在的 hostname（不在 DB 的可能）
+	for hn := range byHost {
+		hosts[hn] = true
+	}
+
+	now := time.Now()
+	expiresAt := now.Add(analyticsCacheTTL)
+	for hn := range hosts {
+		rows := byHost[hn]
+		m, ts := aggregateAnalyticsRows(rows)
+		key := fmt.Sprintf("%s:%s:%s", zoneID, hn, rangeStr)
+		h.analyticsMu.Lock()
+		h.analyticsCache[key] = &analyticsCacheEntry{metrics: m, timeseries: ts, expiresAt: expiresAt}
+		h.analyticsMu.Unlock()
+		// 谨慎释放锁避免长时间持有
+	}
 }
 
 // availableLocalZones 返回本地 zones 表中排除被封禁账号的域名。

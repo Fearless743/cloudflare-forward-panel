@@ -457,6 +457,203 @@ func (c *Client) EnableGRPC(zoneID string) error {
 	return err
 }
 
+// Analytics（GraphQL Analytics API）
+
+// GraphQLRequest GraphQL 请求体
+type GraphQLRequest struct {
+	Query     string                 `json:"query"`
+	Variables map[string]interface{} `json:"variables,omitempty"`
+}
+
+// GraphQLResponse GraphQL 响应体（与 REST 的 CFResponse 结构不同）
+type GraphQLResponse struct {
+	Data   json.RawMessage `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors,omitempty"`
+}
+
+// ZoneHTTPMetrics httpRequestsAdaptiveGroups 聚合结果（一行 = 一个时间桶）
+// Dimensions 含分钟/小时两档粒度与 hostname（ByZone 分组查询时填充）。
+type ZoneHTTPMetrics struct {
+	Sum struct {
+		Requests          int64 `json:"requests"`
+		EdgeResponseBytes int64 `json:"edgeResponseBytes"`
+		Visits            int64 `json:"visits"`
+	} `json:"sum"`
+	Uniq struct {
+		Uniques int64 `json:"uniques"`
+	} `json:"uniq"`
+	Dimensions struct {
+		DatetimeMinute       string `json:"datetimeMinute"`
+		DatetimeHour         string `json:"datetimeHour"`
+		ClientRequestHTTPHost string `json:"clientRequestHTTPHost"`
+	} `json:"dimensions"`
+}
+
+// TimeKey 返回该行的聚合时间桶标识（分钟或小时），用于 timeseries
+func (m *ZoneHTTPMetrics) TimeKey() string {
+	if m.Dimensions.DatetimeMinute != "" {
+		return m.Dimensions.DatetimeMinute
+	}
+	return m.Dimensions.DatetimeHour
+}
+
+// quoteGraphQLString 把字符串转义为合法的 GraphQL 字符串字面量（含引号）。
+// JSON 转义子集兼容 GraphQL 字符串语法（\" \\ \uXXXX 等）。
+func quoteGraphQLString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// doGraphQL 发送 GraphQL 请求并返回 data 字段原文。
+// GraphQL 端点与 REST 使用相同的 X-Auth-Key/X-Auth-Email 认证头，但响应结构为
+// {data, errors} 而非 {success, result}，因此单独实现请求与解析（不复用 doRequest）。
+func (c *Client) doGraphQL(query string) (json.RawMessage, error) {
+	body := GraphQLRequest{Query: query}
+	jsonBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal graphql request: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/graphql", bytes.NewReader(jsonBytes))
+	if err != nil {
+		return nil, fmt.Errorf("create graphql request: %w", err)
+	}
+
+	log.Printf("[CF API] POST /graphql (analytics)")
+	req.Header.Set("Content-Type", "application/json")
+	c.setAuthHeaders(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do graphql request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read graphql body: %w", err)
+	}
+
+	// GraphQL 鉴权失败等错误没有 rest 的 success 字段，直接看 HTTP 状态码
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cloudflare graphql error: HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var gql GraphQLResponse
+	if err := json.Unmarshal(respBody, &gql); err != nil {
+		return nil, fmt.Errorf("unmarshal graphql response: %w", err)
+	}
+	if len(gql.Errors) > 0 {
+		msgs := make([]string, 0, len(gql.Errors))
+		for _, e := range gql.Errors {
+			msgs = append(msgs, e.Message)
+		}
+		return nil, fmt.Errorf("cloudflare graphql error: %s", strings.Join(msgs, "; "))
+	}
+	return gql.Data, nil
+}
+
+// analyticsGrain 根据时间窗口选择聚合粒度，保证行数不超过 CF 的 limit=10000 上限：
+//   - ≤26h（对应 range=24h）：分钟级，1440 行
+//   - 更长（7d/30d）：小时级，168/720 行
+// 分钟级 30d = 43200 行会触发 CF 截断，导致 metrics 聚合值错误，故长窗口降为小时级。
+func analyticsGrain(geq, lt time.Time) (dimension, orderBy string) {
+	if lt.Sub(geq) <= 26*time.Hour {
+		return "datetimeMinute", "datetimeMinute_ASC"
+	}
+	return "datetimeHour", "datetimeHour_ASC"
+}
+
+// queryZoneMetrics 查询 zone 下 hostname 的 HTTP 请求流量指标。
+// timeRange [geq, lt)；该 hostname 无流量时返回空列表而非错误（调用方降级为零值）。
+// groupByHost 为 true 时不按 hostname 过滤，改为在 dimensions 中返回
+// clientRequestHTTPHost，一次查询取回 zone 内所有 hostname 的数据（缓存回填优化用）。
+func (c *Client) queryZoneMetrics(zoneID, hostname string, geq, lt time.Time, groupByHost bool) ([]ZoneHTTPMetrics, error) {
+	dimension, orderBy := analyticsGrain(geq, lt)
+
+	hostFilter := ""
+	if !groupByHost {
+		hostFilter = ", clientRequestHTTPHost: " + quoteGraphQLString(hostname)
+	}
+	dimensions := dimension
+	if groupByHost {
+		dimensions += " clientRequestHTTPHost"
+	}
+
+	query := fmt.Sprintf(`query ZoneHTTPMetrics {
+  viewer {
+    zones(filter: {zoneTag: %s}) {
+      httpRequestsAdaptiveGroups(
+        limit: 10000
+        filter: {datetime_geq: %s, datetime_lt: %s%s, requestSource: "eyeball"}
+        orderBy: [%s]
+      ) {
+        sum { requests edgeResponseBytes visits }
+        uniq { uniques }
+        dimensions { %s }
+      }
+    }
+  }
+}`,
+		quoteGraphQLString(zoneID),
+		quoteGraphQLString(geq.UTC().Format(time.RFC3339)),
+		quoteGraphQLString(lt.UTC().Format(time.RFC3339)),
+		hostFilter,
+		orderBy,
+		dimensions,
+	)
+
+	data, err := c.doGraphQL(query)
+	if err != nil {
+		return nil, err
+	}
+
+	var parsed struct {
+		Viewer struct {
+			Zones []struct {
+				HTTPRequestsAdaptiveGroups []ZoneHTTPMetrics `json:"httpRequestsAdaptiveGroups"`
+			} `json:"zones"`
+		} `json:"viewer"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return nil, fmt.Errorf("parse graphql data: %w", err)
+	}
+	if len(parsed.Viewer.Zones) == 0 {
+		// zoneTag 无效或 zone 无数据
+		return nil, nil
+	}
+	return parsed.Viewer.Zones[0].HTTPRequestsAdaptiveGroups, nil
+}
+
+// QueryZoneHTTPMetrics 查询指定 zone 下某个 hostname 的 HTTP 请求流量指标。
+// 时间范围 [geq, lt)；按窗口自适应分钟/小时粒度，返回聚合桶列表。
+func (c *Client) QueryZoneHTTPMetrics(zoneID, hostname string, geq, lt time.Time) ([]ZoneHTTPMetrics, error) {
+	return c.queryZoneMetrics(zoneID, hostname, geq, lt, false)
+}
+
+// QueryZoneHTTPMetricsByZone 一次 GraphQL 请求取回 zone 下所有 hostname 的流量指标，
+// 按 hostname 分组返回（dimensions 含 clientRequestHTTPHost）。
+// 供「同一 zone 的多个转发规则合并为一次查询」的缓存回填优化使用。
+// 注意：同一窗口下行数 = hostname 数 × 时间桶数，受 limit 10000 限制，
+// 大量 hostname 时可能截断，调用方应自行控制（面板场景 zone 内 hostname 极少）。
+func (c *Client) QueryZoneHTTPMetricsByZone(zoneID string, geq, lt time.Time) (map[string][]ZoneHTTPMetrics, error) {
+	rows, err := c.queryZoneMetrics(zoneID, "", geq, lt, true)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string][]ZoneHTTPMetrics)
+	for _, row := range rows {
+		host := row.Dimensions.ClientRequestHTTPHost
+		if host == "" {
+			continue
+		}
+		result[host] = append(result[host], row)
+	}
+	return result, nil
+}
+
 // Origin Certificate
 
 type OriginCertificateRequest struct {

@@ -13,6 +13,8 @@ function ForwardRules() {
   const [modalOpen, setModalOpen] = useState(false)
   const [editingRule, setEditingRule] = useState<ForwardRule | null>(null)
   const [form] = Form.useForm()
+  // 创建/编辑请求进行中，用于禁用提交按钮防止重复提交
+  const [submitting, setSubmitting] = useState(false)
 
   // 证书相关状态
   const [certModalOpen, setCertModalOpen] = useState(false)
@@ -96,9 +98,11 @@ function ForwardRules() {
   }
 
   const handleSubmit = async () => {
+    if (submitting) return // 请求进行中，防止重复提交
     try {
       const values = await form.validateFields()
       const zoneId = values.zone_id || undefined // 空 → 自动选择
+      setSubmitting(true)
 
       if (editingRule) {
         await updateForwardRule(editingRule.id, {
@@ -123,6 +127,8 @@ function ForwardRules() {
       if (err instanceof Error) {
         message.error(err.message)
       }
+    } finally {
+      setSubmitting(false)
     }
   }
 
@@ -302,6 +308,8 @@ function ForwardRules() {
         okText="保存"
         cancelText="取消"
         width={500}
+        confirmLoading={submitting}
+        okButtonProps={{ disabled: submitting }}
       >
         <Form form={form} layout="vertical">
           <Form.Item
