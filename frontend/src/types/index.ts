@@ -7,6 +7,15 @@ export interface Zone {
   created_on: string
 }
 
+// 本地 zones 表中的可用域名（排除被封禁账号），供转发规则表单下拉选择
+export interface LocalZone {
+  id: number
+  cf_id: string
+  account_id: number
+  name: string
+  status: string
+}
+
 export interface DNSRecord {
   id: string
   zone_id: string

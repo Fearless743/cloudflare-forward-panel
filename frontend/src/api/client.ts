@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { Zone, DNSRecord, SSLSetting, CFResponse } from '../types'
+import type { Zone, LocalZone, DNSRecord, SSLSetting, CFResponse } from '../types'
 
 export interface ForwardRule {
   id: number
@@ -85,15 +85,19 @@ export const updateSSLSettings = (zoneId: string, value: string) =>
 // Forward Rules (全局端口转发)
 export const getForwardRules = () =>
   api.get<CFResponse<ForwardRule[]>>('/forward-rules')
+// 本地 zones 表中的可用域名（排除封禁账号），供转发规则下拉选择
+export const getLocalZones = () => api.get<CFResponse<LocalZone[]>>('/forward-rules/zones')
 export const createForwardRule = (data: {
   origin_port: number
   origin_host: string
   enabled: boolean
+  zone_id?: string
 }) => api.post<CFResponse<ForwardRule>>('/forward-rules', data)
 export const updateForwardRule = (ruleId: number, data: {
   origin_port: number
   origin_host: string
   enabled: boolean
+  zone_id?: string
 }) => api.put<CFResponse<ForwardRule>>(`/forward-rules/${ruleId}`, data)
 export const deleteForwardRule = (ruleId: number) =>
   api.delete(`/forward-rules/${ruleId}`)

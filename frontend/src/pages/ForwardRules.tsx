@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
-import { Table, Tag, Button, Space, Typography, Modal, Form, Input, InputNumber, Switch, message, Popconfirm, Alert, Tabs } from 'antd'
+import { Table, Tag, Button, Space, Typography, Modal, Form, Input, InputNumber, Switch, Select, message, Popconfirm, Alert, Tabs } from 'antd'
 import { ReloadOutlined, PlusOutlined, DeleteOutlined, EditOutlined, CopyOutlined, DownloadOutlined } from '@ant-design/icons'
-import { getForwardRules, createForwardRule, updateForwardRule, deleteForwardRule, toggleForwardRule, generateOriginCertificate } from '../api/client'
-import type { ForwardRule, OriginCertificate } from '../types'
+import { getForwardRules, createForwardRule, updateForwardRule, deleteForwardRule, toggleForwardRule, generateOriginCertificate, getLocalZones } from '../api/client'
+import type { ForwardRule, OriginCertificate, LocalZone } from '../types'
 
 const { Title, Text, Paragraph } = Typography
 const { TextArea } = Input
@@ -21,6 +21,8 @@ function ForwardRules() {
   const [selectedRule, setSelectedRule] = useState<ForwardRule | null>(null)
   // 删除中的规则 ID，用于防重复提交
   const [deletingId, setDeletingId] = useState<number | null>(null)
+  // 可选域名下拉列表
+  const [localZones, setLocalZones] = useState<LocalZone[]>([])
 
   const fetchData = async () => {
     setLoading(true)
@@ -35,14 +37,24 @@ function ForwardRules() {
     }
   }
 
+  const fetchZones = async () => {
+    try {
+      const res = await getLocalZones()
+      setLocalZones(res.data.result || [])
+    } catch {
+      // 下拉加载失败不阻塞表单，用户仍可「自动选择」
+    }
+  }
+
   useEffect(() => {
     fetchData()
+    fetchZones()
   }, [])
 
   const handleCreate = () => {
     setEditingRule(null)
     form.resetFields()
-    form.setFieldsValue({ enabled: true })
+    form.setFieldsValue({ enabled: true, zone_id: undefined })
     setModalOpen(true)
   }
 
@@ -52,6 +64,7 @@ function ForwardRules() {
       origin_port: rule.origin_port,
       origin_host: rule.origin_host,
       enabled: rule.enabled,
+      zone_id: rule.zone_id, // 预填当前 zone
     })
     setModalOpen(true)
   }
@@ -85,12 +98,14 @@ function ForwardRules() {
   const handleSubmit = async () => {
     try {
       const values = await form.validateFields()
+      const zoneId = values.zone_id || undefined // 空 → 自动选择
 
       if (editingRule) {
         await updateForwardRule(editingRule.id, {
           origin_port: values.origin_port,
           origin_host: values.origin_host || '',
           enabled: editingRule.enabled,
+          zone_id: zoneId,
         })
         message.success('更新成功')
       } else {
@@ -98,6 +113,7 @@ function ForwardRules() {
           origin_port: values.origin_port,
           origin_host: values.origin_host || '',
           enabled: true,
+          zone_id: zoneId,
         })
         message.success('创建成功')
       }
@@ -306,6 +322,17 @@ function ForwardRules() {
               max={65535}
               style={{ width: '100%' }}
               placeholder="例如: 8080"
+            />
+          </Form.Item>
+          <Form.Item
+            name="zone_id"
+            label="域名"
+            tooltip="不选则自动选择 Cloudflare 侧规则数最少的域名；编辑时清空则保持当前域名"
+          >
+            <Select
+              allowClear
+              placeholder="自动选择"
+              options={localZones.map(z => ({ value: z.cf_id, label: z.name }))}
             />
           </Form.Item>
         </Form>
