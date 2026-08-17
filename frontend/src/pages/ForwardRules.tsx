@@ -1,11 +1,20 @@
 import { useEffect, useState } from 'react'
-import { Table, Tag, Button, Space, Typography, Modal, Form, Input, InputNumber, Switch, Select, message, Popconfirm, Alert, Tabs } from 'antd'
+import { Table, Tag, Button, Space, Typography, Modal, Form, Input, InputNumber, Switch, Select, message, Popconfirm, Alert, Tabs, Spin, Statistic } from 'antd'
 import { ReloadOutlined, PlusOutlined, DeleteOutlined, EditOutlined, CopyOutlined, DownloadOutlined } from '@ant-design/icons'
-import { getForwardRules, createForwardRule, updateForwardRule, deleteForwardRule, toggleForwardRule, generateOriginCertificate, getLocalZones } from '../api/client'
+import { getForwardRules, createForwardRule, updateForwardRule, deleteForwardRule, toggleForwardRule, generateOriginCertificate, getLocalZones, getRuleAnalytics } from '../api/client'
 import type { ForwardRule, OriginCertificate, LocalZone } from '../types'
+import type { RuleAnalyticsData } from '../api/client'
 
 const { Title, Text, Paragraph } = Typography
 const { TextArea } = Input
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  const val = bytes / Math.pow(1024, i)
+  return `${val.toFixed(i === 0 ? 0 : 2)} ${units[i]}`
+}
 
 function ForwardRules() {
   const [rules, setRules] = useState<ForwardRule[]>([])
@@ -26,11 +35,37 @@ function ForwardRules() {
   // 可选域名下拉列表
   const [localZones, setLocalZones] = useState<LocalZone[]>([])
 
+  // 流量统计（按规则 ID 索引）
+  const [analyticsMap, setAnalyticsMap] = useState<Record<number, RuleAnalyticsData | null>>({})
+  const [analyticsLoading, setAnalyticsLoading] = useState<Record<number, boolean>>({})
+
   const fetchData = async () => {
     setLoading(true)
     try {
       const rulesRes = await getForwardRules()
-      setRules(rulesRes.data.result || [])
+      const rules = rulesRes.data.result || []
+      setRules(rules)
+
+      // 并行拉取所有规则的 analytics
+      const loadingMap: Record<number, boolean> = {}
+      rules.forEach((r: ForwardRule) => { loadingMap[r.id] = true })
+      setAnalyticsLoading(loadingMap)
+
+      const results = await Promise.allSettled(
+        rules.map((r: ForwardRule) => getRuleAnalytics(r.id, '24h'))
+      )
+      const newMap: Record<number, RuleAnalyticsData | null> = {}
+      const newLoading: Record<number, boolean> = {}
+      rules.forEach((r: ForwardRule, i: number) => {
+        newLoading[r.id] = false
+        if (results[i].status === 'fulfilled') {
+          newMap[r.id] = results[i].value.data.data
+        } else {
+          newMap[r.id] = null
+        }
+      })
+      setAnalyticsMap(newMap)
+      setAnalyticsLoading(newLoading)
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : '加载失败'
       message.error(errorMessage)
@@ -221,6 +256,30 @@ function ForwardRules() {
           onChange={() => handleToggle(record.id)}
         />
       ),
+    },
+    {
+      title: '请求数（24h）',
+      key: 'requests',
+      width: 140,
+      render: (_: unknown, record: ForwardRule) => {
+        const loading = analyticsLoading[record.id]
+        if (loading) return <Spin size="small" />
+        const data = analyticsMap[record.id]
+        if (!data) return <Text type="secondary">-</Text>
+        return <Statistic value={data.metrics.total_requests} valueStyle={{ fontSize: 14 }} suffix="req" />
+      },
+    },
+    {
+      title: '带宽（24h）',
+      key: 'bandwidth',
+      width: 140,
+      render: (_: unknown, record: ForwardRule) => {
+        const loading = analyticsLoading[record.id]
+        if (loading) return <Spin size="small" />
+        const data = analyticsMap[record.id]
+        if (!data) return <Text type="secondary">-</Text>
+        return <Statistic value={data.metrics.total_bytes} valueStyle={{ fontSize: 14 }} formatter={v => formatBytes(Number(v))} />
+      },
     },
     {
       title: '操作',

@@ -257,3 +257,32 @@ export const importRegistrarDomains = (id: number, domains: string[]) =>
 // 重试失败/跳过的导入任务
 export const retryImportTasks = (registrarId: number) =>
   api.post<CFResponse<{ message: string }>>(`/registrars/${registrarId}/tasks/retry`)
+
+// Analytics (流量统计)
+export interface RuleAnalyticsMetrics {
+  total_requests: number
+  total_bytes: number
+  total_visits: number
+  unique_ips: number
+}
+
+export interface RuleAnalyticsTimeseriesPoint {
+  time: string
+  requests: number
+  bytes: number
+}
+
+export interface RuleAnalyticsData {
+  rule_id: number
+  hostname: string
+  zone_id: string
+  zone_name: string
+  range: string
+  cached: boolean
+  metrics: RuleAnalyticsMetrics
+  timeseries: RuleAnalyticsTimeseriesPoint[]
+  error?: string
+}
+
+export const getRuleAnalytics = (ruleId: number, range = '24h') =>
+  api.get<{ success: boolean; data: RuleAnalyticsData }>(`/forward-rules/${ruleId}/analytics`, { params: { range } })
