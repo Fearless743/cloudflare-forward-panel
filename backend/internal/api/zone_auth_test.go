@@ -1,8 +1,12 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"net/http/httptest"
 	"testing"
 
+	"cloudflare-forward-panel/internal/auth"
 	"cloudflare-forward-panel/internal/models"
 
 	"github.com/glebarez/sqlite"
@@ -67,5 +71,49 @@ func TestUserCanUseZoneCFID(t *testing.T) {
 	}
 	if h.userCanUseZoneCFID(1, "cf-missing") {
 		t.Fatal("missing zone should not be usable")
+	}
+}
+
+func TestListForwardRulesOnlyOwn(t *testing.T) {
+	h := newTestHandler(t)
+	if err := h.db.AutoMigrate(&models.ForwardRule{}); err != nil {
+		t.Fatalf("migrate forward rules: %v", err)
+	}
+
+	rules := []models.ForwardRule{
+		{UserID: 1, ZoneID: "cf-a", ZoneName: "a.example.com", Hostname: "a.a.example.com", OriginPort: 1001},
+		{UserID: 2, ZoneID: "cf-a", ZoneName: "a.example.com", Hostname: "b.a.example.com", OriginPort: 1001},
+	}
+	for i := range rules {
+		if err := h.db.Create(&rules[i]).Error; err != nil {
+			t.Fatalf("create rule: %v", err)
+		}
+	}
+
+	// 管理员与普通用户都只能看到自己创建的规则
+	for _, role := range []string{"admin", "user"} {
+		claims := &auth.Claims{UserID: 1, Username: "u1", Role: role}
+		req := httptest.NewRequest("GET", "/api/forward-rules", nil)
+		req = req.WithContext(context.WithValue(req.Context(), auth.UserContextKey, claims))
+		w := httptest.NewRecorder()
+
+		h.listForwardRules(w, req)
+
+		var resp struct {
+			Success bool `json:"success"`
+			Result  []struct {
+				UserID   uint   `json:"user_id"`
+				Hostname string `json:"hostname"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("role %s: decode response: %v", role, err)
+		}
+		if !resp.Success || len(resp.Result) != 1 {
+			t.Fatalf("role %s: got %d rules, want 1", role, len(resp.Result))
+		}
+		if resp.Result[0].UserID != 1 || resp.Result[0].Hostname != "a.a.example.com" {
+			t.Fatalf("role %s: got %+v, want only own rule", role, resp.Result[0])
+		}
 	}
 }

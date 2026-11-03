@@ -1484,19 +1484,16 @@ func (h *Handler) listForwardRules(w http.ResponseWriter, r *http.Request) {
 	h.pauseExpiredSubscriptions()
 
 	claims := auth.GetUserFromContext(r)
-
-	query := h.db.Order("zone_name, hostname")
-	// 普通用户仅能查看自己的规则，管理员可见全部
-	if claims == nil || claims.Role != "admin" {
-		if claims == nil {
-			respondError(w, http.StatusUnauthorized, "未授权")
-			return
-		}
-		query = query.Where("user_id = ?", claims.UserID)
+	if claims == nil {
+		respondError(w, http.StatusUnauthorized, "未授权")
+		return
 	}
 
+	// 所有用户（包括管理员）都只能查看自己创建的规则，避免跨用户看到他人记录
 	var rules []models.ForwardRule
-	query.Find(&rules)
+	h.db.Where("user_id = ?", claims.UserID).
+		Order("zone_name, hostname").
+		Find(&rules)
 
 	// 附加创建者用户名
 	userNames := make(map[uint]string)
