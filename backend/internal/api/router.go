@@ -156,6 +156,26 @@ func (h *Handler) MigrateAccountRules(blockedAccountID uint) {
 
 // migratePortGroup 迁移某个端口下的所有目标到目标账号（重建 Origin Rule + DNS）。
 func (h *Handler) migratePortGroup(client *cfclient.Client, zones []models.Zone, account *models.CFAccount, port int, group []*models.ForwardRule) error {
+	// 仅允许迁移到「该端口下所有规则所有者都被分配」的域名，避免自动迁移到未授权域名。
+	// 无归属（UserID==0）的历史规则不受限制，保持旧行为。
+	allowedZones := make([]models.Zone, 0, len(zones))
+	for _, z := range zones {
+		allowed := true
+		for _, r := range group {
+			if r.UserID != 0 && !h.userCanUseZone(r.UserID, z.ID) {
+				allowed = false
+				break
+			}
+		}
+		if allowed {
+			allowedZones = append(allowedZones, z)
+		}
+	}
+	if len(allowedZones) == 0 {
+		return fmt.Errorf("目标账号下没有分配给规则所有者的域名，暂不迁移")
+	}
+	zones = allowedZones
+
 	// 挑选规则最少的 Zone：以 CF 侧 http_request_origin 真实规则数为准（含外部手工规则）。
 	// 同端口多目标共享一条 CF 规则，本地行数会虚高，故不能用本地 ForwardRule 行数排名。
 	bestZone := zones[0]
@@ -1805,6 +1825,13 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 			respondError(w, http.StatusBadRequest, "没有可用的域名，请联系管理员分配域名或解除账号封禁")
 			return
 		}
+	}
+
+	// 兜底校验：无论显式指定还是自动选择，都必须使用分配给当前用户的域名。
+	// 防止后续逻辑调整（如自动选域、迁移）绕过授权过滤。
+	if !h.userCanUseZone(claims.UserID, bestZone.ID) {
+		respondError(w, http.StatusForbidden, "无权使用该域名，请联系管理员分配")
+		return
 	}
 
 	// 自动生成子域名（使用随机字符串）
