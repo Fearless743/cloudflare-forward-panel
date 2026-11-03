@@ -116,16 +116,18 @@ func (m *Manager) ReportError(accountID uint, errMsg string) {
 		if strings.Contains(errMsg, fmt.Sprintf("[%d]", code)) {
 			log.Printf("[CF Manager] 账号 %d 被标记为封禁", accountID)
 			m.db.Model(&models.CFAccount{}).Where("id = ?", accountID).Update("is_blocked", true)
-			// 停用本地规则并更新内存客户端列表（耗时短，锁内完成）
-			m.deactivateAccountRulesLocal(accountID)
+			// 先把账号从可用列表中移除（轻量操作，锁内完成）
 			m.loadAccounts()
 			cb := m.onAccountBlocked
 			m.mu.Unlock()
-			// 封号回调（自动迁移规则）放到锁外执行，避免网络操作持锁
+			// 先执行迁移回调：此时规则仍保留原始 enabled 状态，
+			// 迁移后才能正确恢复启用/禁用状态（若先停用再迁移，所有规则都会变成禁用）。
+			// ReportError 本身已由 doRequest 以 goroutine 调用，此处同步等待不会阻塞请求。
 			if cb != nil {
-				go cb(accountID)
+				cb(accountID)
 			}
-			// 停用 CF 侧规则是网络操作，放到锁外执行
+			// 迁移失败的规则仍归属封禁账号：停用本地与 CF 侧规则
+			m.deactivateAccountRulesLocal(accountID)
 			m.deactivateAccountRulesRemote(accountID)
 			return
 		}
@@ -283,6 +285,26 @@ func (m *Manager) ListAllZoneNames() []string {
 		}
 	}
 	return names
+}
+
+// ListAllZones 遍历所有可用账号，返回全部 Zone（用于「域名管理」页面展示跨账号域名）。
+// 单个账号失败只记录日志，不影响其他账号。
+func (m *Manager) ListAllZones() []Zone {
+	m.mu.RLock()
+	clients := make([]*Client, len(m.clients))
+	copy(clients, m.clients)
+	m.mu.RUnlock()
+
+	all := make([]Zone, 0)
+	for _, c := range clients {
+		zones, err := c.ListAllZones()
+		if err != nil {
+			log.Printf("[CF Manager] 账号 %d 拉取 Zone 失败: %v", c.accountID, err)
+			continue
+		}
+		all = append(all, zones...)
+	}
+	return all
 }
 
 // SyncLocalZones 从所有 CF 账号拉取全部 Zone，写入本地 zones 表

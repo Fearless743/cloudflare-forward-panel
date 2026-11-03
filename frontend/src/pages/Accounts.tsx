@@ -93,7 +93,8 @@ function Accounts() {
         await updateAccount(editingAccount.id, {
           email: values.email,
           api_key: values.api_key,
-          account_id: values.account_id || undefined,
+          // 传空字符串表示清空 CF 账号 ID（undefined 会被 axios 丢弃，无法清空）
+          account_id: values.account_id ?? '',
         })
         message.success('更新成功')
       } else {

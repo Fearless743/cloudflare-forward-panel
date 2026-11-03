@@ -50,14 +50,14 @@ type Zone struct {
 }
 
 type DNSRecord struct {
-	ID       string `json:"id"`
-	ZoneID   string `json:"zone_id"`
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	Content  string `json:"content"`
-	TTL      int    `json:"ttl"`
-	Proxied  bool   `json:"proxied"`
-	Comment  string `json:"comment"`
+	ID      string `json:"id"`
+	ZoneID  string `json:"zone_id"`
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Content string `json:"content"`
+	TTL     int    `json:"ttl"`
+	Proxied bool   `json:"proxied"`
+	Comment string `json:"comment"`
 }
 
 type OriginRuleset struct {
@@ -71,16 +71,16 @@ type OriginRuleset struct {
 }
 
 type OriginRule struct {
-	ID               string           `json:"id,omitempty"`
-	Description      string           `json:"description"`
-	Expression       string           `json:"expression"`
-	Action           string           `json:"action"`
-	ActionParameters *ActionParams    `json:"action_parameters"`
-	Enabled          bool             `json:"enabled"`
+	ID               string        `json:"id,omitempty"`
+	Description      string        `json:"description"`
+	Expression       string        `json:"expression"`
+	Action           string        `json:"action"`
+	ActionParameters *ActionParams `json:"action_parameters"`
+	Enabled          bool          `json:"enabled"`
 }
 
 type ActionParams struct {
-	Origin     *OriginParams `json:"origin"`
+	Origin *OriginParams `json:"origin"`
 	// HostHeader 留空时不发送，避免 CF API 报 cannot be empty
 	HostHeader string `json:"host_header,omitempty"`
 }
@@ -278,19 +278,28 @@ func parseTokenAccountID(token string) string {
 // DNS Records
 
 func (c *Client) ListDNSRecords(zoneID string, recordType string) ([]DNSRecord, error) {
-	path := fmt.Sprintf("/zones/%s/dns_records?per_page=100", zoneID)
-	if recordType != "" {
-		path += "&type=" + recordType
+	var all []DNSRecord
+	// 分页拉取：单页上限 100，超过 100 条时若不翻页会漏记录，
+	// 对账逻辑会因此误判记录丢失并创建重复 DNS。
+	for page := 1; ; page++ {
+		path := fmt.Sprintf("/zones/%s/dns_records?per_page=100&page=%d", zoneID, page)
+		if recordType != "" {
+			path += "&type=" + recordType
+		}
+		resp, err := c.doRequest("GET", path, nil)
+		if err != nil {
+			return nil, err
+		}
+		var records []DNSRecord
+		if err := json.Unmarshal(resp.Result, &records); err != nil {
+			return nil, err
+		}
+		all = append(all, records...)
+		if len(records) < 100 {
+			break
+		}
 	}
-	resp, err := c.doRequest("GET", path, nil)
-	if err != nil {
-		return nil, err
-	}
-	var records []DNSRecord
-	if err := json.Unmarshal(resp.Result, &records); err != nil {
-		return nil, err
-	}
-	return records, nil
+	return all, nil
 }
 
 func (c *Client) CreateDNSRecord(zoneID string, record *DNSRecord) (*DNSRecord, error) {

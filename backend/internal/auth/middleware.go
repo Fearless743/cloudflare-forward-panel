@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 )
@@ -13,8 +14,8 @@ const UserContextKey contextKey = "user"
 
 // UserInfo 用户在数据库中的实时状态，用于每次请求时校验
 type UserInfo struct {
-	Role              string
-	IsActive          bool
+	Role               string
+	IsActive           bool
 	MustChangePassword bool
 }
 
@@ -31,21 +32,21 @@ func Middleware(validate UserValidator) func(http.Handler) http.Handler {
 			// 获取 Authorization header
 			authHeader := r.Header.Get("Authorization")
 			if authHeader == "" {
-				http.Error(w, `{"error":"未提供认证信息"}`, http.StatusUnauthorized)
+				writeJSONError(w, http.StatusUnauthorized, "未提供认证信息")
 				return
 			}
 
 			// 检查 Bearer token 格式
 			parts := strings.SplitN(authHeader, " ", 2)
 			if len(parts) != 2 || parts[0] != "Bearer" {
-				http.Error(w, `{"error":"认证格式错误"}`, http.StatusUnauthorized)
+				writeJSONError(w, http.StatusUnauthorized, "认证格式错误")
 				return
 			}
 
 			// 解析 token
 			claims, err := ParseToken(parts[1])
 			if err != nil {
-				http.Error(w, `{"error":"登录已过期，请重新登录"}`, http.StatusUnauthorized)
+				writeJSONError(w, http.StatusUnauthorized, "登录已过期，请重新登录")
 				return
 			}
 
@@ -53,7 +54,7 @@ func Middleware(validate UserValidator) func(http.Handler) http.Handler {
 			if validate != nil {
 				info := validate(claims.UserID)
 				if info == nil || !info.IsActive {
-					http.Error(w, `{"error":"账号已禁用或不存在"}`, http.StatusUnauthorized)
+					writeJSONError(w, http.StatusUnauthorized, "账号已禁用或不存在")
 					return
 				}
 				claims.Role = info.Role
@@ -62,7 +63,7 @@ func Middleware(validate UserValidator) func(http.Handler) http.Handler {
 
 			// 需要强制修改密码时，仅允许访问修改密码接口
 			if claims.MustChangePassword && !strings.HasSuffix(r.URL.Path, "/auth/change-password") {
-				http.Error(w, `{"error":"首次登录需修改密码"}`, http.StatusForbidden)
+				writeJSONError(w, http.StatusForbidden, "首次登录需修改密码")
 				return
 			}
 
@@ -78,12 +79,12 @@ func AdminMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := r.Context().Value(UserContextKey).(*Claims)
 		if !ok {
-			http.Error(w, `{"error":"未授权"}`, http.StatusUnauthorized)
+			writeJSONError(w, http.StatusUnauthorized, "未授权")
 			return
 		}
 
 		if claims.Role != "admin" {
-			http.Error(w, `{"error":"需要管理员权限"}`, http.StatusForbidden)
+			writeJSONError(w, http.StatusForbidden, "需要管理员权限")
 			return
 		}
 
@@ -95,4 +96,13 @@ func AdminMiddleware(next http.Handler) http.Handler {
 func GetUserFromContext(r *http.Request) *Claims {
 	claims, _ := r.Context().Value(UserContextKey).(*Claims)
 	return claims
+}
+
+// writeJSONError 以 JSON 返回认证/权限错误。
+// 不能用 http.Error：它会把 Content-Type 设为 text/plain，
+// 前端 axios 拿到的 data 是字符串而不是对象，无法读取 error 字段（如首次改密跳转）。
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }

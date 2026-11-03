@@ -254,7 +254,7 @@ function ForwardRules() {
       <Alert
         message={
           <span>
-            每个域名最多支持 <strong>10</strong> 条转发规则。
+            同一端口的多条规则会共享一条 Cloudflare Origin Rule。
             当前已有 <strong>{Object.keys(zonePortCounts).length}</strong> 个域名，共 <strong>{rules.length}</strong> 条规则。
             创建规则时会自动将 SSL/TLS 设置为 Full 模式。
           </span>
@@ -274,8 +274,8 @@ function ForwardRules() {
               const zoneRule = rules.find(r => r.zone_name === name)
               return (
                 <Space key={name} size={0}>
-                  <Tag color={count >= 10 ? 'red' : count >= 5 ? 'orange' : 'green'}>
-                    {name}: {count}/10
+                  <Tag color="blue">
+                    {name}: {count} 个端口
                   </Tag>
                   <Button
                     type="link"

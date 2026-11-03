@@ -5,6 +5,8 @@ export interface Zone {
   name_servers: string[]
   plan: { name: string }
   created_on: string
+  user_ids?: number[]
+  usernames?: string[]
 }
 
 // 本地 zones 表中的可用域名（排除被封禁账号），供转发规则表单下拉选择

@@ -14,6 +14,8 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -46,10 +48,14 @@ func (h *Handler) getCFClient() (*cfclient.Client, error) {
 	return h.manager.GetClient()
 }
 
-// maskSecret 掩码敏感字段，保留首尾各4位；过短则整体返回。
+// maskSecret 掩码敏感字段，保留首尾各4位；过短则整体隐藏。
+// 注意：短密钥不能原样返回，否则「掩码」等于泄露。
 func maskSecret(s string) string {
+	if s == "" {
+		return ""
+	}
 	if len(s) <= 8 {
-		return s
+		return "****"
 	}
 	return s[:4] + "****" + s[len(s)-4:]
 }
@@ -64,13 +70,28 @@ func (h *Handler) getCFClientForAccount(accountID uint) (*cfclient.Client, error
 	return h.manager.GetClientByAccountID(accountID)
 }
 
+// getCFClientForZone 根据本地 Zone 镜像找到其所属账号，用对应账号的凭证操作。
+// 多账号场景下，若用轮询到的其他账号访问 Zone，会返回鉴权错误甚至误判账号被封禁。
+// 本地无该 Zone 的归属信息时回退到轮询客户端（兼容历史数据）。
+func (h *Handler) getCFClientForZone(zoneID string) (*cfclient.Client, error) {
+	var zone models.Zone
+	if err := h.db.Select("account_id").Where("cf_id = ?", zoneID).First(&zone).Error; err == nil && zone.AccountID != 0 {
+		return h.getCFClientForAccount(zone.AccountID)
+	}
+	return h.getCFClient()
+}
+
 // migrateBlockedAccounts 遍历所有被封禁账号，尝试把其遗留规则迁移到可用账号。
 // 用于「后续添加新账号」时，把之前因无可用账号而停用的规则补齐迁移。
 func (h *Handler) migrateBlockedAccounts() {
 	var blockedIDs []uint
 	h.db.Model(&models.CFAccount{}).Where("is_blocked = ?", true).Pluck("id", &blockedIDs)
 	for _, id := range blockedIDs {
+		// 这些规则当初因账号封禁被自动停用（本地 enabled=false），
+		// 迁移时按「启用」重建到新账号；迁移后仍归属封禁账号的行再恢复停用。
+		h.db.Model(&models.ForwardRule{}).Where("account_id = ?", id).Update("enabled", true)
 		h.MigrateAccountRules(id)
+		h.db.Model(&models.ForwardRule{}).Where("account_id = ?", id).Update("enabled", false)
 	}
 }
 
@@ -226,7 +247,10 @@ func (h *Handler) migratePortGroup(client *cfclient.Client, zones []models.Zone,
 
 	var newRuleID string
 	if len(created.Rules) > 0 {
-		newRuleID = created.Rules[len(created.Rules)-1].ID
+		newRuleID = findRuleIDByPort(created.Rules, port)
+		if newRuleID == "" && len(created.Rules) == 1 {
+			newRuleID = created.Rules[0].ID
+		}
 	}
 
 	// 目标 Zone 同样开启转发所需设置（SSL Full + WebSockets + gRPC，忽略错误）
@@ -317,6 +341,7 @@ func (h *Handler) Router() *chi.Mux {
 				r.Route("/zones", func(r chi.Router) {
 					r.Get("/", h.listZones)
 					r.Get("/{zoneID}", h.getZone)
+					r.Put("/{zoneID}/users", h.updateZoneUsers) // 分配域名给用户
 
 					r.Route("/{zoneID}/dns", func(r chi.Router) {
 						r.Get("/", h.listDNSRecords)
@@ -391,6 +416,15 @@ func respondError(w http.ResponseWriter, status int, msg string) {
 		"success": false,
 		"error":   msg,
 	})
+}
+
+// isUniqueConstraintErr 判断是否为数据库唯一约束冲突。
+func isUniqueConstraintErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique constraint") || strings.Contains(msg, "duplicate")
 }
 
 // Settings
@@ -730,6 +764,10 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Password != nil && *req.Password != "" {
+		if len(*req.Password) < 6 {
+			respondError(w, http.StatusBadRequest, "密码至少6位")
+			return
+		}
 		hash, err := auth.HashPassword(*req.Password)
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, "密码加密失败")
@@ -739,6 +777,12 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Role != nil && (*req.Role == "admin" || *req.Role == "user") {
+		// 防止管理员把自己降级后失去所有管理入口
+		claims := auth.GetUserFromContext(r)
+		if *req.Role == "user" && user.Role == "admin" && claims != nil && claims.UserID == user.ID {
+			respondError(w, http.StatusBadRequest, "不能取消自己的管理员权限")
+			return
+		}
 		user.Role = *req.Role
 	}
 
@@ -786,6 +830,12 @@ func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
 	if ruleCount > 0 {
 		respondError(w, http.StatusBadRequest,
 			fmt.Sprintf("该用户下有 %d 条转发规则，请先删除所有规则后再删除用户", ruleCount))
+		return
+	}
+
+	// 删除用户时同步清理域名分配关系
+	if err := h.db.Where("user_id = ?", userID).Delete(&models.ZoneUser{}).Error; err != nil {
+		respondError(w, http.StatusInternalServerError, "清理域名分配失败")
 		return
 	}
 
@@ -893,6 +943,8 @@ func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
 
 	// 刷新管理器
 	h.manager.ReloadAccounts()
+	// 同步新账号的 Zone 到本地表，否则新增账号的域名要重启后才能用于转发/迁移
+	h.manager.SyncLocalZones()
 
 	// 新账号可用，立即尝试处理等待中的导入任务
 	h.scheduler.Trigger()
@@ -917,9 +969,9 @@ func (h *Handler) updateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Email     string `json:"email"`
-		APIKey    string `json:"api_key"`
-		AccountID string `json:"account_id"`
+		Email     *string `json:"email"`
+		APIKey    *string `json:"api_key"`
+		AccountID *string `json:"account_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, "invalid request body")
@@ -932,14 +984,15 @@ func (h *Handler) updateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Email != "" {
-		account.Email = strings.TrimSpace(req.Email)
+	if req.Email != nil && strings.TrimSpace(*req.Email) != "" {
+		account.Email = strings.TrimSpace(*req.Email)
 	}
-	if req.APIKey != "" && !strings.Contains(req.APIKey, "****") {
-		account.APIKey = strings.TrimSpace(req.APIKey)
+	if req.APIKey != nil && *req.APIKey != "" && !strings.Contains(*req.APIKey, "****") {
+		account.APIKey = strings.TrimSpace(*req.APIKey)
 	}
-	if req.AccountID != "" {
-		account.AccountID = strings.TrimSpace(req.AccountID)
+	// 使用指针区分「未传」与「传空字符串」：允许清空 CF 账号 ID
+	if req.AccountID != nil {
+		account.AccountID = strings.TrimSpace(*req.AccountID)
 	}
 
 	h.db.Save(&account)
@@ -979,6 +1032,20 @@ func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 删除账号时同步删除其本地 Zone 镜像（避免转发规则创建时选中已删除账号的域名）
+	// 以及这些域名的用户分配关系
+	var zoneIDs []uint
+	if err := tx.Model(&models.Zone{}).Where("account_id = ?", accountID).Pluck("id", &zoneIDs).Error; err != nil {
+		tx.Rollback()
+		respondError(w, http.StatusInternalServerError, "查询 Zone 镜像失败: "+err.Error())
+		return
+	}
+	if len(zoneIDs) > 0 {
+		if err := tx.Where("zone_id IN ?", zoneIDs).Delete(&models.ZoneUser{}).Error; err != nil {
+			tx.Rollback()
+			respondError(w, http.StatusInternalServerError, "删除域名分配失败: "+err.Error())
+			return
+		}
+	}
 	if err := tx.Where("account_id = ?", accountID).Delete(&models.Zone{}).Error; err != nil {
 		tx.Rollback()
 		respondError(w, http.StatusInternalServerError, "删除 Zone 镜像失败: "+err.Error())
@@ -1014,8 +1081,9 @@ func (h *Handler) toggleAccount(w http.ResponseWriter, r *http.Request) {
 	h.db.Save(&account)
 	h.manager.ReloadAccounts()
 
-	// 启用账号时触发导入调度
+	// 启用账号时触发导入调度，并同步该账号的 Zone
 	if account.IsActive {
+		h.manager.SyncLocalZones()
 		h.scheduler.Trigger()
 	}
 
@@ -1062,40 +1130,154 @@ func (h *Handler) getAccountStatus(w http.ResponseWriter, r *http.Request) {
 // Zones
 
 func (h *Handler) listZones(w http.ResponseWriter, r *http.Request) {
-	client, err := h.getCFClient()
-	if err != nil {
-		respondError(w, http.StatusBadRequest, err.Error())
+	// 汇总所有账号的 Zone，避免多账号场景下只看到当前轮询账号的域名
+	if h.manager.GetClientCount() == 0 {
+		respondError(w, http.StatusBadRequest, "没有可用的 Cloudflare 账号")
 		return
 	}
 
-	zones, err := client.ListZones()
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, err.Error())
-		return
+	zones := h.manager.ListAllZones()
+
+	// 附加域名已分配的用户，供管理页面展示与编辑
+	type zoneWithUsers struct {
+		cfclient.Zone
+		UserIDs   []uint   `json:"user_ids"`
+		Usernames []string `json:"usernames"`
 	}
+
+	cfIDs := make([]string, 0, len(zones))
+	for _, z := range zones {
+		cfIDs = append(cfIDs, z.ID)
+	}
+
+	var localZones []models.Zone
+	if len(cfIDs) > 0 {
+		h.db.Where("cf_id IN ?", cfIDs).Find(&localZones)
+	}
+	cfIDToLocalID := make(map[string]uint, len(localZones))
+	localIDs := make([]uint, 0, len(localZones))
+	for _, z := range localZones {
+		cfIDToLocalID[z.CFID] = z.ID
+		localIDs = append(localIDs, z.ID)
+	}
+
+	assignmentsByZone := make(map[uint][]uint)
+	if len(localIDs) > 0 {
+		var assignments []models.ZoneUser
+		h.db.Where("zone_id IN ?", localIDs).Order("id ASC").Find(&assignments)
+		for _, a := range assignments {
+			assignmentsByZone[a.ZoneID] = append(assignmentsByZone[a.ZoneID], a.UserID)
+		}
+	}
+
+	var users []models.User
+	h.db.Select("id", "username").Find(&users)
+	usernameByID := make(map[uint]string, len(users))
+	for _, u := range users {
+		usernameByID[u.ID] = u.Username
+	}
+
+	result := make([]zoneWithUsers, 0, len(zones))
+	for _, z := range zones {
+		item := zoneWithUsers{Zone: z, UserIDs: []uint{}, Usernames: []string{}}
+		if localID, ok := cfIDToLocalID[z.ID]; ok {
+			for _, uid := range assignmentsByZone[localID] {
+				item.UserIDs = append(item.UserIDs, uid)
+				item.Usernames = append(item.Usernames, usernameByID[uid])
+			}
+		}
+		result = append(result, item)
+	}
+
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"result":  zones,
+		"result":  result,
 	})
 }
 
-// listLocalZones 返回本地 zones 表中可用（排除被封禁账号）的域名列表，供转发规则表单下拉选择。
-// 注意：区别于 listZones（实时调 CF API），此处直接读本地 zones 表。
-func (h *Handler) listLocalZones(w http.ResponseWriter, r *http.Request) {
+// updateZoneUsers 覆盖式设置某个域名的授权用户列表（仅管理员）。
+func (h *Handler) updateZoneUsers(w http.ResponseWriter, r *http.Request) {
+	zoneCFID := chi.URLParam(r, "zoneID")
+
+	var req struct {
+		UserIDs []uint `json:"user_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	var zone models.Zone
+	if err := h.db.Where("cf_id = ?", zoneCFID).First(&zone).Error; err != nil {
+		respondError(w, http.StatusNotFound, "域名不存在或尚未同步到本地")
+		return
+	}
+
+	// 校验用户存在并去重
+	seen := make(map[uint]bool, len(req.UserIDs))
+	userIDs := make([]uint, 0, len(req.UserIDs))
+	for _, uid := range req.UserIDs {
+		if seen[uid] {
+			continue
+		}
+		var user models.User
+		if err := h.db.Where("id = ?", uid).First(&user).Error; err != nil {
+			respondError(w, http.StatusBadRequest, fmt.Sprintf("用户 %d 不存在", uid))
+			return
+		}
+		seen[uid] = true
+		userIDs = append(userIDs, uid)
+	}
+
+	err := h.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("zone_id = ?", zone.ID).Delete(&models.ZoneUser{}).Error; err != nil {
+			return err
+		}
+		for _, uid := range userIDs {
+			if err := tx.Create(&models.ZoneUser{ZoneID: zone.ID, UserID: uid}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "保存域名分配失败: "+err.Error())
+		return
+	}
+
+	claims := auth.GetUserFromContext(r)
+	if claims != nil {
+		log.Printf("[Admin] 管理员 %s 将域名 %s 分配给用户 %v", claims.Username, zone.Name, userIDs)
+	}
+
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"result":  h.availableLocalZones(),
+		"result":  map[string]interface{}{"user_ids": userIDs},
+	})
+}
+
+// listLocalZones 返回当前用户可用的本地域名列表（排除被封禁账号），供转发规则表单下拉选择。
+// 管理员可使用全部域名；普通用户只能使用被管理员分配的域名。
+func (h *Handler) listLocalZones(w http.ResponseWriter, r *http.Request) {
+	claims := auth.GetUserFromContext(r)
+	if claims == nil {
+		respondError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"result":  h.availableLocalZonesForUser(claims.UserID, claims.Role),
 	})
 }
 
 func (h *Handler) getZone(w http.ResponseWriter, r *http.Request) {
-	client, err := h.getCFClient()
+	zoneID := chi.URLParam(r, "zoneID")
+	client, err := h.getCFClientForZone(zoneID)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	zoneID := chi.URLParam(r, "zoneID")
 	zone, err := client.GetZone(zoneID)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, err.Error())
@@ -1110,13 +1292,13 @@ func (h *Handler) getZone(w http.ResponseWriter, r *http.Request) {
 // DNS Records
 
 func (h *Handler) listDNSRecords(w http.ResponseWriter, r *http.Request) {
-	client, err := h.getCFClient()
+	zoneID := chi.URLParam(r, "zoneID")
+	client, err := h.getCFClientForZone(zoneID)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	zoneID := chi.URLParam(r, "zoneID")
 	recordType := r.URL.Query().Get("type")
 
 	records, err := client.ListDNSRecords(zoneID, recordType)
@@ -1131,13 +1313,12 @@ func (h *Handler) listDNSRecords(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) createDNSRecord(w http.ResponseWriter, r *http.Request) {
-	client, err := h.getCFClient()
+	zoneID := chi.URLParam(r, "zoneID")
+	client, err := h.getCFClientForZone(zoneID)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	zoneID := chi.URLParam(r, "zoneID")
 
 	var record cfclient.DNSRecord
 	if err := json.NewDecoder(r.Body).Decode(&record); err != nil {
@@ -1157,16 +1338,16 @@ func (h *Handler) createDNSRecord(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) updateDNSRecord(w http.ResponseWriter, r *http.Request) {
-	client, err := h.getCFClient()
-	if err != nil {
-		respondError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
 	recordID := chi.URLParam(r, "recordID")
 	zoneID := r.URL.Query().Get("zone_id")
 	if zoneID == "" {
 		respondError(w, http.StatusBadRequest, "zone_id query parameter required")
+		return
+	}
+
+	client, err := h.getCFClientForZone(zoneID)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1188,16 +1369,16 @@ func (h *Handler) updateDNSRecord(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) deleteDNSRecord(w http.ResponseWriter, r *http.Request) {
-	client, err := h.getCFClient()
-	if err != nil {
-		respondError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
 	recordID := chi.URLParam(r, "recordID")
 	zoneID := r.URL.Query().Get("zone_id")
 	if zoneID == "" {
 		respondError(w, http.StatusBadRequest, "zone_id query parameter required")
+		return
+	}
+
+	client, err := h.getCFClientForZone(zoneID)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1222,13 +1403,12 @@ func (h *Handler) deleteDNSRecord(w http.ResponseWriter, r *http.Request) {
 // SSL/TLS
 
 func (h *Handler) getSSLSettings(w http.ResponseWriter, r *http.Request) {
-	client, err := h.getCFClient()
+	zoneID := chi.URLParam(r, "zoneID")
+	client, err := h.getCFClientForZone(zoneID)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	zoneID := chi.URLParam(r, "zoneID")
 
 	setting, err := client.GetSSLSettings(zoneID)
 	if err != nil {
@@ -1242,13 +1422,12 @@ func (h *Handler) getSSLSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) updateSSLSettings(w http.ResponseWriter, r *http.Request) {
-	client, err := h.getCFClient()
+	zoneID := chi.URLParam(r, "zoneID")
+	client, err := h.getCFClientForZone(zoneID)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	zoneID := chi.URLParam(r, "zoneID")
 
 	var req struct {
 		Value string `json:"value"`
@@ -1357,6 +1536,62 @@ func (h *Handler) findAvailableZoneByCFID(cfid string) (*models.Zone, error) {
 	return nil, fmt.Errorf("指定的域名不存在或所属账号已被封禁")
 }
 
+// authorizedZoneIDs 返回用户被授权的本地 Zone 主键。
+func (h *Handler) authorizedZoneIDs(userID uint) []uint {
+	var ids []uint
+	h.db.Model(&models.ZoneUser{}).Where("user_id = ?", userID).Pluck("zone_id", &ids)
+	return ids
+}
+
+// availableLocalZonesForUser 返回用户可用的域名。
+// 管理员可使用全部可用域名；普通用户仅可使用被分配的域名，未分配域名不可用。
+func (h *Handler) availableLocalZonesForUser(userID uint, role string) []models.Zone {
+	zones := h.availableLocalZones()
+	if role == "admin" {
+		return zones
+	}
+
+	ids := h.authorizedZoneIDs(userID)
+	if len(ids) == 0 {
+		return []models.Zone{}
+	}
+	allowed := make(map[uint]bool, len(ids))
+	for _, id := range ids {
+		allowed[id] = true
+	}
+
+	filtered := make([]models.Zone, 0, len(zones))
+	for _, z := range zones {
+		if allowed[z.ID] {
+			filtered = append(filtered, z)
+		}
+	}
+	return filtered
+}
+
+// userCanUseZone 判断用户是否可使用某个本地 Zone（管理员始终可用）。
+func (h *Handler) userCanUseZone(userID uint, role string, zoneID uint) bool {
+	if role == "admin" {
+		return true
+	}
+	var count int64
+	h.db.Model(&models.ZoneUser{}).Where("zone_id = ? AND user_id = ?", zoneID, userID).Count(&count)
+	return count > 0
+}
+
+// userCanUseZoneCFID 按 Cloudflare Zone ID 判断用户的域名使用权限。
+// 普通用户遇到本地不存在的 Zone 时视为无权使用。
+func (h *Handler) userCanUseZoneCFID(userID uint, role string, cfid string) bool {
+	if role == "admin" {
+		return true
+	}
+	var zone models.Zone
+	if err := h.db.Where("cf_id = ?", cfid).First(&zone).Error; err != nil {
+		return false
+	}
+	return h.userCanUseZone(userID, role, zone.ID)
+}
+
 // enableZoneForwardingSettings 开启转发所需的 Zone 设置：SSL Full、WebSockets、gRPC。
 // 均为幂等操作，忽略错误（不阻断规则创建）。
 func enableZoneForwardingSettings(client *cfclient.Client, zoneID string) {
@@ -1379,7 +1614,7 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusNotFound, "用户不存在")
 		return
 	}
-	if !isSubscriptionValid(&user) {
+	if claims.Role != "admin" && !isSubscriptionValid(&user) {
 		respondError(w, http.StatusForbidden, "订阅已过期，无法创建转发规则")
 		return
 	}
@@ -1396,8 +1631,8 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 验证必填字段
-	if req.OriginPort == 0 || req.OriginHost == "" {
-		respondError(w, http.StatusBadRequest, "origin_port, origin_host are required")
+	if req.OriginPort < 1 || req.OriginPort > 65535 || req.OriginHost == "" {
+		respondError(w, http.StatusBadRequest, "origin_port 必须在 1-65535 之间，origin_host 不能为空")
 		return
 	}
 
@@ -1409,6 +1644,10 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 			respondError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if !h.userCanUseZone(claims.UserID, claims.Role, z.ID) {
+			respondError(w, http.StatusForbidden, "无权使用该域名，请联系管理员分配")
+			return
+		}
 		selectedZone = z
 	}
 
@@ -1416,6 +1655,11 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 	// 并为这个新目标插入一行独立的 ForwardRule（共享同一 CF 规则）。
 	// 端口全局唯一：任意用户创建已存在的端口都复用同一条规则。
 	if existing := h.findExistingRuleForPort(req.OriginPort); existing != nil {
+		// 普通用户不能借用未分配给自己的域名
+		if !h.userCanUseZoneCFID(claims.UserID, claims.Role, existing.ZoneID) {
+			respondError(w, http.StatusForbidden, "该端口已绑定域名 "+existing.ZoneName+"，无权使用该域名")
+			return
+		}
 		// 用户显式指定域名但端口已绑定到其他域名 → 报错
 		if selectedZone != nil && selectedZone.CFID != existing.ZoneID {
 			respondError(w, http.StatusBadRequest, "该端口已绑定域名 "+existing.ZoneName+"，无法指定其他域名")
@@ -1439,7 +1683,13 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 			CFRuleID:    existing.CFRuleID,
 			DNSRecordID: dnsRecordID,
 		}
-		h.db.Create(&newRow)
+		if err := h.db.Create(&newRow).Error; err != nil {
+			if c, cerr := h.getCFClientForAccount(newRow.AccountID); cerr == nil {
+				_ = c.DeleteDNSRecord(newRow.ZoneID, newRow.DNSRecordID)
+			}
+			respondError(w, http.StatusInternalServerError, "保存规则失败: "+err.Error())
+			return
+		}
 
 		// 按所有「启用行」统一重建共享规则表达式（禁用行不进入表达式）
 		client, err := h.getCFClientForAccount(existing.AccountID)
@@ -1487,9 +1737,9 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 		bestZone = *selectedZone
 	} else {
 		// 自动选择可用的域名（优先填满一个域名）
-		availableZones := h.availableLocalZones()
+		availableZones := h.availableLocalZonesForUser(claims.UserID, claims.Role)
 		if len(availableZones) == 0 {
-			respondError(w, http.StatusBadRequest, "没有可用的域名，请先在域名管理中添加或解除账号封禁")
+			respondError(w, http.StatusBadRequest, "没有可用的域名，请联系管理员分配域名或解除账号封禁")
 			return
 		}
 
@@ -1561,7 +1811,7 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 		case hasEmpty:
 			bestZone = empty.zone
 		default:
-			respondError(w, http.StatusBadRequest, "没有可用的域名，请先在域名管理中添加或解除账号封禁")
+			respondError(w, http.StatusBadRequest, "没有可用的域名，请联系管理员分配域名或解除账号封禁")
 			return
 		}
 	}
@@ -1639,9 +1889,20 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 		DNSRecordID: createdDNS.ID,
 	}
 	if len(created.Rules) > 0 {
-		localRule.CFRuleID = created.Rules[len(created.Rules)-1].ID
+		localRule.CFRuleID = findRuleIDByPort(created.Rules, req.OriginPort)
+		if localRule.CFRuleID == "" && len(created.Rules) == 1 {
+			localRule.CFRuleID = created.Rules[0].ID
+		}
 	}
-	h.db.Create(&localRule)
+	if err := h.db.Create(&localRule).Error; err != nil {
+		// 本地保存失败：回滚刚创建的 DNS（ruleset 仅在本次新建时删除，避免误删共享规则）
+		_ = client.DeleteDNSRecord(bestZone.CFID, createdDNS.ID)
+		if isNew {
+			_ = client.DeleteOriginRuleset(bestZone.CFID, created.ID)
+		}
+		respondError(w, http.StatusInternalServerError, "保存规则失败: "+err.Error())
+		return
+	}
 
 	// 自动开启转发所需设置（SSL Full + WebSockets + gRPC，忽略错误，不影响规则创建）
 	enableZoneForwardingSettings(client, bestZone.CFID)
@@ -1760,6 +2021,8 @@ func (h *Handler) removeHostnameFromRule(client *cfclient.Client, rule *models.F
 	if idx == -1 {
 		return fmt.Errorf("Cloudflare 规则不存在")
 	}
+	// 保留 CF 表达式中属于面板外手工添加的主机名
+	hosts = append(hosts, h.externalHostnames(rule, full.Rules[idx].Expression)...)
 	if len(hosts) == 0 {
 		// 剩余行全部禁用：整条 rule 禁用（与 syncRuleExpression 一致，避免空表达式）
 		full.Rules[idx].Enabled = false
@@ -1771,6 +2034,36 @@ func (h *Handler) removeHostnameFromRule(client *cfclient.Client, rule *models.F
 		return fmt.Errorf("更新 Cloudflare 规则失败: %w", err)
 	}
 	return nil
+}
+
+// externalHostnames 返回 CF 规则表达式中不属于任何本地 ForwardRule 的主机名
+// （通常是用户直接在 Cloudflare 面板手工添加的规则）。
+// 重建表达式时必须保留它们，否则切换/删除一条面板规则会误删手工规则。
+func (h *Handler) externalHostnames(rule *models.ForwardRule, expression string) []string {
+	if rule.CFRuleSetID == "" || rule.CFRuleID == "" {
+		return nil
+	}
+	var rows []models.ForwardRule
+	h.db.Select("hostname").
+		Where("cf_rule_set_id = ? AND cf_rule_id = ?", rule.CFRuleSetID, rule.CFRuleID).
+		Find(&rows)
+
+	managed := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		managed[strings.ToLower(r.Hostname)] = true
+	}
+
+	out := make([]string, 0)
+	for _, host := range parseHostnameList(expression) {
+		// 当前操作涉及的主机名必须被移除，不能当作「外部主机」保留
+		if strings.EqualFold(host, rule.Hostname) {
+			continue
+		}
+		if !managed[strings.ToLower(host)] {
+			out = append(out, host)
+		}
+	}
+	return out
 }
 
 func (h *Handler) updateForwardRule(w http.ResponseWriter, r *http.Request) {
@@ -1794,8 +2087,8 @@ func (h *Handler) updateForwardRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 验证必填字段
-	if req.OriginPort == 0 || req.OriginHost == "" {
-		respondError(w, http.StatusBadRequest, "origin_port, origin_host are required")
+	if req.OriginPort < 1 || req.OriginPort > 65535 || req.OriginHost == "" {
+		respondError(w, http.StatusBadRequest, "origin_port 必须在 1-65535 之间，origin_host 不能为空")
 		return
 	}
 
@@ -1823,30 +2116,35 @@ func (h *Handler) updateForwardRule(w http.ResponseWriter, r *http.Request) {
 			respondError(w, http.StatusForbidden, "订阅已过期，无法修改转发规则")
 			return
 		}
-	}
 
-	// 检查端口是否被其他规则使用（同一子域名+端口不允许重复）
-	var existing models.ForwardRule
-	if err := h.db.Where("zone_id = ? AND hostname = ? AND origin_port = ? AND id != ?", localRule.ZoneID, localRule.Hostname, req.OriginPort, ruleID).First(&existing).Error; err == nil {
-		respondError(w, http.StatusBadRequest, "该子域名的端口转发规则已存在")
-		return
-	}
-
-	// 判断是否需要迁移域名：仅当显式指定且与当前不同才迁移
-	zoneChanged := req.ZoneID != "" && req.ZoneID != localRule.ZoneID
-	if zoneChanged {
-		newZone, err := h.findAvailableZoneByCFID(req.ZoneID)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err.Error())
+		// 普通用户只能把规则迁移到被分配的域名
+		if req.ZoneID != "" && req.ZoneID != localRule.ZoneID && !h.userCanUseZoneCFID(claims.UserID, claims.Role, req.ZoneID) {
+			respondError(w, http.StatusForbidden, "无权使用该域名，请联系管理员分配")
 			return
 		}
-		// 先应用本次请求的 origin_port / origin_host / enabled 到内存，
-		// 迁移时在新域名按最新值建资源
-		localRule.OriginPort = req.OriginPort
-		localRule.OriginHost = req.OriginHost
-		localRule.Enabled = req.Enabled
+		// 改端口时会复用该端口已有的共享规则，需确认用户对目标域名有权限
+		if req.OriginPort != localRule.OriginPort {
+			if existing := h.findExistingRuleForPortExcluding(req.OriginPort, localRule.ID); existing != nil && existing.CFRuleSetID != "" {
+				if !h.userCanUseZoneCFID(claims.UserID, claims.Role, existing.ZoneID) {
+					respondError(w, http.StatusForbidden, "该端口已绑定域名 "+existing.ZoneName+"，无权使用该域名")
+					return
+				}
+			}
+		}
+	}
 
-		if err := h.migrateRuleToZone(&localRule, newZone); err != nil {
+	// 端口/域名变更需要重建或迁移 CF 资源；仅改目标地址时才走原地更新。
+	// 注意：此前实现只改了本地 origin_port，CF 侧 Origin Rule 的端口不会变化，
+	// 导致面板显示已修改但实际流量仍转发到旧端口。
+	portChanged := req.OriginPort != localRule.OriginPort
+	zoneChanged := req.ZoneID != "" && req.ZoneID != localRule.ZoneID
+	if portChanged || zoneChanged {
+		if err := h.reconfigureForwardRule(&localRule, req.OriginPort, req.OriginHost, req.Enabled, req.ZoneID); err != nil {
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// 重新读取，返回迁移/对账后的最新数据
+		if err := h.db.Where("id = ?", ruleID).First(&localRule).Error; err != nil {
 			respondError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -1864,43 +2162,14 @@ func (h *Handler) updateForwardRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 目标地址变化时同步更新 DNS 记录（先改 DNS，再改本地）
-	originHostChanged := req.OriginHost != localRule.OriginHost
-	if originHostChanged && localRule.DNSRecordID != "" {
-		oldType := detectDNSRecordType(localRule.OriginHost)
-		newType := detectDNSRecordType(req.OriginHost)
-		if oldType == newType {
-			updateRecord := &cfclient.DNSRecord{
-				Name:    localRule.Hostname,
-				Type:    newType,
-				Content: req.OriginHost,
-				TTL:     1,
-				Proxied: true,
-			}
-			if _, err := client.UpdateDNSRecord(localRule.ZoneID, localRule.DNSRecordID, updateRecord); err != nil {
-				respondError(w, http.StatusInternalServerError, "更新 DNS 记录失败: "+err.Error())
-				return
-			}
-		} else {
-			oldDNSRecordID := localRule.DNSRecordID
-			newRecord := &cfclient.DNSRecord{
-				ZoneID:  localRule.ZoneID,
-				Name:    localRule.Hostname,
-				Type:    newType,
-				Content: req.OriginHost,
-				TTL:     1,
-				Proxied: true,
-			}
-			createdDNS, err := client.CreateDNSRecord(localRule.ZoneID, newRecord)
-			if err != nil {
-				respondError(w, http.StatusInternalServerError, "更新 DNS 记录失败: "+err.Error())
-				return
-			}
-			// 新记录创建成功后，再删除旧记录（失败仅日志，不影响新记录）
-			if err := client.DeleteDNSRecord(localRule.ZoneID, oldDNSRecordID); err != nil {
-				log.Printf("[ForwardRule] 删除旧 DNS 记录 %s 失败: %v", oldDNSRecordID, err)
-			}
-			localRule.DNSRecordID = createdDNS.ID
-			localRule.DNSRecordID = createdDNS.ID
+	if req.OriginHost != localRule.OriginHost {
+		newDNSID, err := h.updateRuleDNSRecord(client, &localRule, req.OriginHost)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "更新 DNS 记录失败: "+err.Error())
+			return
+		}
+		if newDNSID != "" {
+			localRule.DNSRecordID = newDNSID
 		}
 	}
 
@@ -1911,30 +2180,367 @@ func (h *Handler) updateForwardRule(w http.ResponseWriter, r *http.Request) {
 	h.db.Save(&localRule)
 
 	// 编辑弹窗里的开关会改变 enabled：按「启用行」重建共享规则表达式
-	if err := h.syncRuleExpression(client, &localRule); err != nil {
-		if !forwardRuleMissingErr(err) {
-			respondError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		// CF 侧规则丢失：全量对账补全后重试
-		if _, rerr := h.reconcileZoneForwardRules(client, localRule.ZoneID); rerr != nil {
-			respondError(w, http.StatusInternalServerError, "自动修复规则失败: "+rerr.Error())
-			return
-		}
-		if err := h.db.Where("id = ?", ruleID).First(&localRule).Error; err != nil {
-			respondError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if err := h.syncRuleExpression(client, &localRule); err != nil {
-			respondError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+	if err := h.syncRuleExpressionWithReconcile(client, &localRule); err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"result":  localRule,
 	})
+}
+
+// reconfigureForwardRule 处理规则的端口/域名变更。
+// 端口在面板内是「共享维度」：同端口的多条目标共享一条 CF Origin Rule。
+// 因此改端口时优先并入该端口已有的规则；独占旧规则时可直接改端口；
+// 旧规则被多个目标共享时则为新端口拆出一条独立规则。
+func (h *Handler) reconfigureForwardRule(rule *models.ForwardRule, newPort int, newHost string, enabled bool, requestedZoneID string) error {
+	old := *rule
+	oldClient, err := h.getCFClientForAccount(old.AccountID)
+	if err != nil {
+		return err
+	}
+
+	// 1) 新端口已有其他本地规则：并入该端口的共享规则（必要时跟随其 zone）
+	if existing := h.findExistingRuleForPortExcluding(newPort, old.ID); existing != nil && existing.CFRuleSetID != "" {
+		if requestedZoneID != "" && requestedZoneID != existing.ZoneID {
+			return fmt.Errorf("该端口已绑定域名 %s，无法指定其他域名", existing.ZoneName)
+		}
+		return h.mergeRuleIntoExistingPort(&old, existing, newHost, enabled)
+	}
+
+	// 2) 解析目标 zone
+	targetZone := models.Zone{CFID: old.ZoneID, Name: old.ZoneName, AccountID: old.AccountID}
+	if requestedZoneID != "" && requestedZoneID != old.ZoneID {
+		z, err := h.findAvailableZoneByCFID(requestedZoneID)
+		if err != nil {
+			return err
+		}
+		targetZone = *z
+	}
+
+	// 3) 同 zone：原地改端口或从共享规则中拆分
+	if targetZone.CFID == old.ZoneID {
+		return h.changeRulePortInSameZone(oldClient, &old, newPort, newHost, enabled)
+	}
+
+	// 4) 跨 zone：复用迁移逻辑（按 rule 上最新的端口/目标重建资源）
+	rule.OriginPort = newPort
+	rule.OriginHost = newHost
+	rule.Enabled = enabled
+	return h.migrateRuleToZone(rule, &targetZone)
+}
+
+// changeRulePortInSameZone 在同一个 Zone 内修改端口：
+// - 旧规则独占：直接修改 CF 规则的 origin port；
+// - 旧规则被多个目标共享：为新端口创建独立规则，再从旧共享规则移除本主机名。
+func (h *Handler) changeRulePortInSameZone(client *cfclient.Client, rule *models.ForwardRule, newPort int, newHost string, enabled bool) error {
+	var sharedCount int64
+	h.db.Model(&models.ForwardRule{}).
+		Where("cf_rule_set_id = ? AND cf_rule_id = ?", rule.CFRuleSetID, rule.CFRuleID).
+		Count(&sharedCount)
+
+	if rule.CFRuleSetID != "" && rule.CFRuleID != "" && sharedCount <= 1 {
+		// 独占：先改 CF 端口，再同步目标地址与表达式
+		if err := h.updateRulePort(client, rule, newPort); err != nil {
+			return fmt.Errorf("修改 Cloudflare 规则端口失败: %w", err)
+		}
+		newDNSID, err := h.updateRuleDNSRecord(client, rule, newHost)
+		if err != nil {
+			return fmt.Errorf("更新 DNS 记录失败: %w", err)
+		}
+		rule.OriginPort = newPort
+		rule.OriginHost = newHost
+		rule.Enabled = enabled
+		if newDNSID != "" {
+			rule.DNSRecordID = newDNSID
+		}
+		if err := h.db.Save(rule).Error; err != nil {
+			return err
+		}
+		return h.syncRuleExpressionWithReconcile(client, rule)
+	}
+
+	// 共享：为新端口创建独立规则（本行独占），保留原 hostname/DNS
+	old := *rule
+	ruleset := &cfclient.OriginRuleset{
+		Name:        "CF Panel Port Forwarding",
+		Description: "Port forwarding rules managed by CF Panel",
+		Kind:        "zone",
+		Phase:       "http_request_origin",
+		Rules: []cfclient.OriginRule{{
+			Description: fmt.Sprintf("Forward to port %d", newPort),
+			Expression:  buildHostExpression([]string{old.Hostname}),
+			Action:      "route",
+			ActionParameters: &cfclient.ActionParams{
+				Origin: &cfclient.OriginParams{Port: newPort},
+			},
+			Enabled: enabled,
+		}},
+	}
+	created, _, err := h.ensureOriginRuleset(client, old.ZoneID, ruleset)
+	if err != nil {
+		return fmt.Errorf("为新端口创建 Cloudflare 规则失败: %w", err)
+	}
+	newRuleID := findRuleIDByPort(created.Rules, newPort)
+	if newRuleID == "" && len(created.Rules) == 1 {
+		newRuleID = created.Rules[0].ID
+	}
+	if newRuleID == "" {
+		return fmt.Errorf("未能定位新建的 Cloudflare 规则")
+	}
+
+	newDNSID, err := h.updateRuleDNSRecord(client, &old, newHost)
+	if err != nil {
+		return fmt.Errorf("更新 DNS 记录失败: %w", err)
+	}
+	rule.CFRuleSetID = created.ID
+	rule.CFRuleID = newRuleID
+	rule.OriginPort = newPort
+	rule.OriginHost = newHost
+	rule.Enabled = enabled
+	if newDNSID != "" {
+		rule.DNSRecordID = newDNSID
+	}
+	if err := h.db.Save(rule).Error; err != nil {
+		return err
+	}
+
+	// 本行已指向新规则，此处只清理旧规则中的本机名（DNS 复用，不删除）
+	old.DNSRecordID = ""
+	if err := h.detachRuleFromCF(client, &old); err != nil {
+		log.Printf("[ForwardRule] 拆分端口后清理旧规则失败: %v", err)
+	}
+	return nil
+}
+
+// mergeRuleIntoExistingPort 把本行并入「新端口已有」的共享规则。
+// 同 zone 复用 hostname/DNS；跨 zone 时在目标 zone 新建随机 hostname 与 DNS。
+func (h *Handler) mergeRuleIntoExistingPort(old *models.ForwardRule, existing *models.ForwardRule, newHost string, enabled bool) error {
+	oldSnapshot := *old
+	oldClient, err := h.getCFClientForAccount(oldSnapshot.AccountID)
+	if err != nil {
+		return err
+	}
+	targetClient, err := h.getCFClientForAccount(existing.AccountID)
+	if err != nil {
+		return err
+	}
+
+	sameZone := oldSnapshot.ZoneID == existing.ZoneID
+	newHostname := oldSnapshot.Hostname
+	newDNSID := oldSnapshot.DNSRecordID
+
+	if !sameZone {
+		hostname := fmt.Sprintf("%s.%s", generateRandomString(8), existing.ZoneName)
+		createdDNS, err := targetClient.CreateDNSRecord(existing.ZoneID, &cfclient.DNSRecord{
+			ZoneID:  existing.ZoneID,
+			Name:    hostname,
+			Type:    detectDNSRecordType(newHost),
+			Content: newHost,
+			TTL:     1,
+			Proxied: true,
+		})
+		if err != nil {
+			return fmt.Errorf("在新域名创建 DNS 记录失败: %w", err)
+		}
+		newHostname = hostname
+		newDNSID = createdDNS.ID
+	}
+
+	// 指向目标共享规则
+	old.AccountID = existing.AccountID
+	old.ZoneID = existing.ZoneID
+	old.ZoneName = existing.ZoneName
+	old.Hostname = newHostname
+	old.DNSRecordID = newDNSID
+	old.CFRuleSetID = existing.CFRuleSetID
+	old.CFRuleID = existing.CFRuleID
+	old.OriginPort = existing.OriginPort
+	old.OriginHost = newHost
+	old.Enabled = enabled
+	if err := h.db.Save(old).Error; err != nil {
+		if !sameZone {
+			_ = targetClient.DeleteDNSRecord(existing.ZoneID, newDNSID)
+		}
+		return err
+	}
+
+	// 把新 hostname 并入目标规则表达式（本行此时已被查询到）
+	if err := h.syncRuleExpression(targetClient, old); err != nil {
+		// 回滚本地行指向；跨 zone 时清理刚建的 DNS
+		*old = oldSnapshot
+		_ = h.db.Save(old)
+		if !sameZone {
+			_ = targetClient.DeleteDNSRecord(existing.ZoneID, newDNSID)
+		}
+		return fmt.Errorf("同步目标规则失败: %w", err)
+	}
+
+	// 同 zone 时 DNS 记录仍是旧的，需要把内容更新为新目标地址
+	if sameZone {
+		newDNSID, err = h.updateRuleDNSRecord(targetClient, old, newHost)
+		if err != nil {
+			return fmt.Errorf("更新 DNS 记录失败: %w", err)
+		}
+		if newDNSID != "" {
+			old.DNSRecordID = newDNSID
+			_ = h.db.Save(old)
+		}
+	}
+
+	// 清理旧规则中的本机名；同 zone 复用 DNS，不删除
+	cleanupOld := oldSnapshot
+	if sameZone {
+		cleanupOld.DNSRecordID = ""
+	}
+	if err := h.detachRuleFromCF(oldClient, &cleanupOld); err != nil {
+		log.Printf("[ForwardRule] 并入共享端口后清理旧规则失败: %v", err)
+	}
+	if !sameZone && oldSnapshot.DNSRecordID != "" {
+		if err := oldClient.DeleteDNSRecord(oldSnapshot.ZoneID, oldSnapshot.DNSRecordID); err != nil &&
+			!strings.Contains(err.Error(), "[10001]") {
+			log.Printf("[ForwardRule] 删除旧 DNS 记录 %s 失败: %v", oldSnapshot.DNSRecordID, err)
+		}
+	}
+
+	enableZoneForwardingSettings(targetClient, existing.ZoneID)
+	return nil
+}
+
+// updateRulePort 原地修改一条 CF Origin Rule 的目标端口。
+func (h *Handler) updateRulePort(client *cfclient.Client, rule *models.ForwardRule, newPort int) error {
+	if rule.CFRuleSetID == "" {
+		return nil
+	}
+	full, err := client.GetOriginRuleset(rule.ZoneID, rule.CFRuleSetID)
+	if err != nil {
+		return err
+	}
+	idx := findRuleIndex(full.Rules, rule.CFRuleID)
+	if idx == -1 {
+		return fmt.Errorf("Cloudflare 规则不存在")
+	}
+	if full.Rules[idx].ActionParameters == nil {
+		full.Rules[idx].ActionParameters = &cfclient.ActionParams{}
+	}
+	if full.Rules[idx].ActionParameters.Origin == nil {
+		full.Rules[idx].ActionParameters.Origin = &cfclient.OriginParams{}
+	}
+	full.Rules[idx].ActionParameters.Origin.Port = newPort
+	full.Rules[idx].Description = fmt.Sprintf("Forward to port %d", newPort)
+	_, err = client.UpdateOriginRuleset(rule.ZoneID, rule.CFRuleSetID, full)
+	return err
+}
+
+// updateRuleDNSRecord 更新规则对应 DNS 记录的内容。类型不变时原地 PATCH；
+// 类型变化（A/AAAA/CNAME）时新建记录并删除旧记录。返回新的 DNS 记录 ID。
+func (h *Handler) updateRuleDNSRecord(client *cfclient.Client, rule *models.ForwardRule, newHost string) (string, error) {
+	if rule.DNSRecordID == "" {
+		return "", nil
+	}
+	oldType := detectDNSRecordType(rule.OriginHost)
+	newType := detectDNSRecordType(newHost)
+	if oldType == newType {
+		record := &cfclient.DNSRecord{
+			Name:    rule.Hostname,
+			Type:    newType,
+			Content: newHost,
+			TTL:     1,
+			Proxied: true,
+		}
+		if _, err := client.UpdateDNSRecord(rule.ZoneID, rule.DNSRecordID, record); err != nil {
+			return "", err
+		}
+		return rule.DNSRecordID, nil
+	}
+
+	oldID := rule.DNSRecordID
+	created, err := client.CreateDNSRecord(rule.ZoneID, &cfclient.DNSRecord{
+		ZoneID:  rule.ZoneID,
+		Name:    rule.Hostname,
+		Type:    newType,
+		Content: newHost,
+		TTL:     1,
+		Proxied: true,
+	})
+	if err != nil {
+		return "", err
+	}
+	if err := client.DeleteDNSRecord(rule.ZoneID, oldID); err != nil {
+		log.Printf("[ForwardRule] 删除旧 DNS 记录 %s 失败: %v", oldID, err)
+	}
+	return created.ID, nil
+}
+
+// detachRuleFromCF 从旧 CF 资源中移除一条本地规则对应的 hostname/rule。
+// 与 cleanupRuleFromZone 不同：本函数基于「排除当前行后」的本地引用和 CF 侧真实规则数判断，
+// 不会因为「同端口只剩另一条共享行」而误删仍被引用的规则。
+func (h *Handler) detachRuleFromCF(client *cfclient.Client, rule *models.ForwardRule) error {
+	if rule.CFRuleSetID == "" {
+		return nil
+	}
+	full, err := client.GetOriginRuleset(rule.ZoneID, rule.CFRuleSetID)
+	if err != nil {
+		if strings.Contains(err.Error(), "[10001]") {
+			return nil
+		}
+		return err
+	}
+	idx := findRuleIndex(full.Rules, rule.CFRuleID)
+	if idx == -1 {
+		return nil
+	}
+
+	var remainingSameRule int64
+	h.db.Model(&models.ForwardRule{}).
+		Where("cf_rule_set_id = ? AND cf_rule_id = ? AND id != ?", rule.CFRuleSetID, rule.CFRuleID, rule.ID).
+		Count(&remainingSameRule)
+	if remainingSameRule > 0 {
+		return h.removeHostnameFromRule(client, rule)
+	}
+
+	// 没有其他本地行共享该规则，但 CF 表达式里可能还有面板外手工添加的主机名：
+	// 此时只移除本行 hostname，绝不能删除整条规则/ ruleset。
+	remainingExprHosts := make([]string, 0)
+	for _, h := range parseHostnameList(full.Rules[idx].Expression) {
+		if !strings.EqualFold(h, rule.Hostname) {
+			remainingExprHosts = append(remainingExprHosts, h)
+		}
+	}
+	if len(remainingExprHosts) > 0 {
+		full.Rules[idx].Expression = buildHostExpression(remainingExprHosts)
+		_, err := client.UpdateOriginRuleset(rule.ZoneID, rule.CFRuleSetID, full)
+		return err
+	}
+
+	var remainingSet int64
+	h.db.Model(&models.ForwardRule{}).
+		Where("cf_rule_set_id = ? AND id != ?", rule.CFRuleSetID, rule.ID).
+		Count(&remainingSet)
+	if len(full.Rules) <= 1 && remainingSet == 0 {
+		return h.deleteRuleset(client, rule)
+	}
+	return h.removeRuleFromRuleset(client, rule)
+}
+
+// syncRuleExpressionWithReconcile 先尝试同步表达式；CF 侧规则丢失时自动对账补全后重试。
+func (h *Handler) syncRuleExpressionWithReconcile(client *cfclient.Client, rule *models.ForwardRule) error {
+	if err := h.syncRuleExpression(client, rule); err != nil {
+		if !forwardRuleMissingErr(err) {
+			return err
+		}
+		if _, rerr := h.reconcileZoneForwardRules(client, rule.ZoneID); rerr != nil {
+			return fmt.Errorf("自动修复规则失败: %w", rerr)
+		}
+		// 对账可能更新了本地行的 CF ID，重新读取后重试
+		if err := h.db.Where("id = ?", rule.ID).First(rule).Error; err != nil {
+			return err
+		}
+		return h.syncRuleExpression(client, rule)
+	}
+	return nil
 }
 
 // migrateRuleToZone 将单条规则迁移到新 zone：
@@ -1989,7 +2595,10 @@ func (h *Handler) migrateRuleToZone(rule *models.ForwardRule, newZone *models.Zo
 	}
 	newRuleID := ""
 	if len(created.Rules) > 0 {
-		newRuleID = created.Rules[len(created.Rules)-1].ID
+		newRuleID = findRuleIDByPort(created.Rules, rule.OriginPort)
+		if newRuleID == "" && len(created.Rules) == 1 {
+			newRuleID = created.Rules[0].ID
+		}
 	}
 
 	// 3) 清理旧 zone（成功建好新资源后再拆旧资源）
@@ -2018,43 +2627,13 @@ func (h *Handler) migrateRuleToZone(rule *models.ForwardRule, newZone *models.Zo
 
 // cleanupRuleFromZone 清理某条规则在 CF 侧的独占资源（rule/ruleset/DNS），但不删除本地行。
 // 同端口多目标共享一条 CF rule 时，仅移除本行 hostname，保留其他目标；
-// 独占时删除整个 ruleset；介于两者之间则仅从 ruleset 移除该 rule。
+// 判断是否删除整个 ruleset 时以 CF 侧真实规则数为准，避免误删面板外手工创建的规则。
 func (h *Handler) cleanupRuleFromZone(client *cfclient.Client, rule *models.ForwardRule) error {
-	var sharedCount int64
-	h.db.Model(&models.ForwardRule{}).
-		Where("cf_rule_set_id = ? AND cf_rule_id = ?", rule.CFRuleSetID, rule.CFRuleID).
-		Count(&sharedCount)
-
-	var setCount int64
-	h.db.Model(&models.ForwardRule{}).
-		Where("cf_rule_set_id = ?", rule.CFRuleSetID).
-		Count(&setCount)
-
-	switch {
-	case sharedCount > 1:
-		// 同 rule 多行共享：从表达式移除本主机名，保留其余目标
-		if err := h.removeHostnameFromRule(client, rule); err != nil {
-			if !forwardRuleMissingErr(err) {
-				return err
-			}
-			log.Printf("[ForwardRule] 迁移清理时 CF 侧规则已不存在，跳过")
+	if err := h.detachRuleFromCF(client, rule); err != nil {
+		if !forwardRuleMissingErr(err) {
+			return err
 		}
-	case setCount <= 1:
-		// ruleset 只有当前行引用：删除整个 ruleset
-		if err := h.deleteRuleset(client, rule); err != nil {
-			if !forwardRuleMissingErr(err) {
-				return err
-			}
-			log.Printf("[ForwardRule] 迁移清理时 CF 侧 ruleset 已不存在，跳过")
-		}
-	default:
-		// ruleset 还有其他 rule（其他端口）：仅移除当前 rule
-		if err := h.removeRuleFromRuleset(client, rule); err != nil {
-			if !forwardRuleMissingErr(err) {
-				return err
-			}
-			log.Printf("[ForwardRule] 迁移清理时 CF 侧规则已不存在，跳过")
-		}
+		log.Printf("[ForwardRule] 迁移清理时 CF 侧规则已不存在，跳过")
 	}
 
 	if rule.DNSRecordID != "" {
@@ -2118,47 +2697,15 @@ func (h *Handler) deleteForwardRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 统计引用同一 CF rule 的本地行数（同端口多目标共享一条 rule）
-	var sharedCount int64
-	h.db.Model(&models.ForwardRule{}).
-		Where("cf_rule_set_id = ? AND cf_rule_id = ?", localRule.CFRuleSetID, localRule.CFRuleID).
-		Count(&sharedCount)
-
-	// 统计引用同一 ruleset 的本地行数（决定能否删除整个 ruleset）
-	var setCount int64
-	h.db.Model(&models.ForwardRule{}).
-		Where("cf_rule_set_id = ?", localRule.CFRuleSetID).
-		Count(&setCount)
-
-	switch {
-	case sharedCount > 1:
-		// 同 rule 多行共享（同端口复用）：从规则表达式移除本主机名，保留其余目标
-		if err := h.removeHostnameFromRule(client, &localRule); err != nil {
-			if !forwardRuleMissingErr(err) {
-				respondError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			// CF 侧规则已丢失：无需从 CF 删除，直接清理本地即可
-			log.Printf("[ForwardRule] 删除规则 %s 时 CF 侧已不存在，跳过 CF 侧清理", localRule.Hostname)
+	// 从 CF 侧移除本行对应资源：
+	// - 同端口多目标共享：只从表达式移除本主机名；
+	// - 独占：按 CF 侧真实规则数决定删除单条规则还是整个 ruleset（避免误删面板外规则）。
+	if err := h.detachRuleFromCF(client, &localRule); err != nil {
+		if !forwardRuleMissingErr(err) {
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
-	case setCount <= 1:
-		// 整个 ruleset 只有当前行引用：删除整个 ruleset
-		if err := h.deleteRuleset(client, &localRule); err != nil {
-			if !forwardRuleMissingErr(err) {
-				respondError(w, http.StatusInternalServerError, "删除 CF ruleset 失败: "+err.Error())
-				return
-			}
-			log.Printf("[ForwardRule] 删除规则 %s 时 CF 侧 ruleset 已不存在，跳过", localRule.Hostname)
-		}
-	default:
-		// ruleset 还有其他规则被本地行引用（其他端口）：仅移除当前 rule，保留 ruleset
-		if err := h.removeRuleFromRuleset(client, &localRule); err != nil {
-			if !forwardRuleMissingErr(err) {
-				respondError(w, http.StatusInternalServerError, "从 CF ruleset 移除规则失败: "+err.Error())
-				return
-			}
-			log.Printf("[ForwardRule] 删除规则 %s 时 CF 侧规则已不存在，跳过", localRule.Hostname)
-		}
+		log.Printf("[ForwardRule] 删除规则 %s 时 CF 侧已不存在，跳过 CF 侧清理", localRule.Hostname)
 	}
 
 	// 删除关联的 DNS 记录（仅当 CF 侧删除成功后才执行，避免 DB 记录已删但 CF 资源残留）
@@ -2292,6 +2839,9 @@ func (h *Handler) syncRuleExpression(client *cfclient.Client, rule *models.Forwa
 		return fmt.Errorf("Cloudflare 规则不存在")
 	}
 
+	// 保留面板外手工添加到同一 CF 规则的主机名
+	hosts = append(hosts, h.externalHostnames(rule, full.Rules[idx].Expression)...)
+
 	if len(hosts) == 0 {
 		// 没有启用的目标：整条 rule 禁用，表达式保留最后一个 hostname 占位
 		full.Rules[idx].Enabled = false
@@ -2321,12 +2871,49 @@ func findRuleIndex(rules []cfclient.OriginRule, ruleID string) int {
 	return -1
 }
 
-// parseHostnameList 将逗号分隔的 hostnames 字符串转为去重后的字符串切片
-func parseHostnameList(s string) []string {
-	parts := strings.Split(s, ",")
+// findRuleIDByPort 在 ruleset 的规则列表中按目标端口查找 rule ID。
+// 合并写入（ensureOriginRuleset）时，新规则可能被合并进已有规则，位置不一定是最后一条，
+// 因此不能用 Rules[len-1] 兜底。
+func findRuleIDByPort(rules []cfclient.OriginRule, port int) string {
+	for i := range rules {
+		r := &rules[i]
+		if r.ActionParameters != nil && r.ActionParameters.Origin != nil &&
+			r.ActionParameters.Origin.Port == port {
+			return r.ID
+		}
+	}
+	return ""
+}
+
+// hostEqRegexp 从 Cloudflare Origin Rule 表达式中提取 http.host eq 的主机名。
+// 表达式形如：(http.host eq "a.example.com") 或
+// ((http.host eq "a.example.com") or (http.host eq "b.example.com"))
+var hostEqRegexp = regexp.MustCompile(`http\.host\s+eq\s+"((?:[^"\\]|\\.)*)"`)
+
+// parseHostnameList 从 Cloudflare 规则表达式中解析出全部主机名。
+// 历史数据可能保存的是逗号分隔的纯 host 列表，此时回退到逗号切分。
+func parseHostnameList(expr string) []string {
 	seen := make(map[string]bool)
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
+	out := make([]string, 0)
+
+	matches := hostEqRegexp.FindAllStringSubmatch(expr, -1)
+	if len(matches) > 0 {
+		for _, m := range matches {
+			h := m[1]
+			// 还原表达式中的转义字符（如 \. / \"）
+			if unquoted, err := strconv.Unquote(`"` + m[1] + `"`); err == nil {
+				h = unquoted
+			}
+			h = strings.TrimSpace(h)
+			if h != "" && !seen[h] {
+				seen[h] = true
+				out = append(out, h)
+			}
+		}
+		return out
+	}
+
+	for _, p := range strings.Split(expr, ",") {
 		p = strings.TrimSpace(p)
 		if p != "" && !seen[p] {
 			seen[p] = true
@@ -2336,13 +2923,27 @@ func parseHostnameList(s string) []string {
 	return out
 }
 
-// buildHostExpression 根据多个主机名构建 http.host 匹配表达式（单个用 eq，多个用 or 连接）
+// buildHostExpression 根据多个主机名构建 http.host 匹配表达式（单个用 eq，多个用 or 连接）。
+// 排序保证同一组主机名生成稳定的表达式，避免无意义更新。
 func buildHostExpression(hostnames []string) string {
-	if len(hostnames) == 1 {
-		return fmt.Sprintf("(http.host eq %q)", hostnames[0])
-	}
-	parts := make([]string, 0, len(hostnames))
+	uniq := make([]string, 0, len(hostnames))
+	seen := make(map[string]bool, len(hostnames))
 	for _, h := range hostnames {
+		if h != "" && !seen[h] {
+			seen[h] = true
+			uniq = append(uniq, h)
+		}
+	}
+	sort.Strings(uniq)
+
+	if len(uniq) == 0 {
+		return ""
+	}
+	if len(uniq) == 1 {
+		return fmt.Sprintf("(http.host eq %q)", uniq[0])
+	}
+	parts := make([]string, 0, len(uniq))
+	for _, h := range uniq {
 		parts = append(parts, fmt.Sprintf("(http.host eq %q)", h))
 	}
 	return "(" + strings.Join(parts, " or ") + ")"
@@ -2350,8 +2951,17 @@ func buildHostExpression(hostnames []string) string {
 
 // findExistingRuleForPort 按端口查找已存在的规则（端口全局唯一，同端口复用）
 func (h *Handler) findExistingRuleForPort(port int) *models.ForwardRule {
+	return h.findExistingRuleForPortExcluding(port, 0)
+}
+
+// findExistingRuleForPortExcluding 按端口查找规则，可排除指定本地行（用于编辑时忽略自身）。
+func (h *Handler) findExistingRuleForPortExcluding(port int, excludeID uint) *models.ForwardRule {
 	var rule models.ForwardRule
-	if err := h.db.Where("origin_port = ?", port).First(&rule).Error; err != nil {
+	query := h.db.Where("origin_port = ?", port)
+	if excludeID != 0 {
+		query = query.Where("id != ?", excludeID)
+	}
+	if err := query.Order("id ASC").First(&rule).Error; err != nil {
 		return nil
 	}
 	return &rule
@@ -2408,21 +3018,25 @@ func (h *Handler) ensureOriginRuleset(client *cfclient.Client, zoneID string, ne
 				existing := &full.Rules[j]
 				if existing.ActionParameters != nil && existing.ActionParameters.Origin != nil &&
 					existing.ActionParameters.Origin.Port == newPort {
-					existingHosts := parseHostnameList(existing.Expression)
-					newHosts := parseHostnameList(newRule.Expression)
-					mergedSet := make(map[string]bool, len(existingHosts)+len(newHosts))
-					for _, h := range existingHosts {
-						mergedSet[h] = true
+					// 禁用的新目标不能并入现有表达式，否则会意外激活该主机名；
+					// 仍标记 merged，避免为同一端口追加重复规则。
+					if newRule.Enabled {
+						existingHosts := parseHostnameList(existing.Expression)
+						newHosts := parseHostnameList(newRule.Expression)
+						mergedSet := make(map[string]bool, len(existingHosts)+len(newHosts))
+						for _, h := range existingHosts {
+							mergedSet[h] = true
+						}
+						for _, h := range newHosts {
+							mergedSet[h] = true
+						}
+						mergedList := make([]string, 0, len(mergedSet))
+						for h := range mergedSet {
+							mergedList = append(mergedList, h)
+						}
+						existing.Expression = buildHostExpression(mergedList)
+						existing.Enabled = true
 					}
-					for _, h := range newHosts {
-						mergedSet[h] = true
-					}
-					mergedList := make([]string, 0, len(mergedSet))
-					for h := range mergedSet {
-						mergedList = append(mergedList, h)
-					}
-					existing.Expression = buildHostExpression(mergedList)
-					existing.Enabled = existing.Enabled || newRule.Enabled
 					merged = true
 					break
 				}
@@ -2600,9 +3214,9 @@ func (h *Handler) reconcileZoneForwardRules(client *cfclient.Client, zoneID stri
 				log.Printf("[ForwardRule] 补回缺失 rule 失败 (%s): %v", full.ID, updateErr)
 				continue
 			}
-			newRuleID := ""
-			if len(updated.Rules) > 0 {
-				newRuleID = updated.Rules[len(updated.Rules)-1].ID
+			newRuleID := findRuleIDByPort(updated.Rules, g.port)
+			if newRuleID == "" && len(updated.Rules) == 1 {
+				newRuleID = updated.Rules[0].ID
 			}
 			for _, r := range g.rows {
 				h.db.Model(r).Update("cf_rule_id", newRuleID)
@@ -2681,8 +3295,8 @@ func (h *Handler) updateGroupCFIDs(groups []*ruleGroup, recreated *cfclient.Orig
 	}
 	for _, g := range groups {
 		ruleID := ruleIDByPort[g.port]
-		if ruleID == "" && len(recreated.Rules) > 0 {
-			ruleID = recreated.Rules[len(recreated.Rules)-1].ID // 兜底
+		if ruleID == "" && len(recreated.Rules) == 1 {
+			ruleID = recreated.Rules[0].ID // 兜底：仅一条规则时无需按端口匹配
 		}
 		for _, r := range g.rows {
 			h.db.Model(r).Updates(map[string]interface{}{
@@ -2716,8 +3330,10 @@ func parseSubscription(s string) (time.Time, error) {
 	}
 
 	// 尝试解析日期格式 (YYYY-MM-DD)
-	if t, err := time.Parse("2006-01-02", s); err == nil {
-		return t, nil
+	// 按本地时区解析，并视为「当天结束前有效」：用户选择 2024-12-31 时，
+	// 到期时间应为 12-31 23:59:59，而不是当天 00:00（否则当天就被判定过期）。
+	if t, err := time.ParseInLocation("2006-01-02", s, time.Local); err == nil {
+		return t.AddDate(0, 0, 1).Add(-time.Second), nil
 	}
 
 	// 尝试解析相对时间格式
@@ -2827,12 +3443,6 @@ func generateRandomString(length int) string {
 
 // generateOriginCertificate 生成 Cloudflare Origin 证书
 func (h *Handler) generateOriginCertificate(w http.ResponseWriter, r *http.Request) {
-	client, err := h.getCFClient()
-	if err != nil {
-		respondError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
 	var req struct {
 		ZoneID    string   `json:"zone_id"`
 		Hostnames []string `json:"hostnames"`
@@ -2844,6 +3454,12 @@ func (h *Handler) generateOriginCertificate(w http.ResponseWriter, r *http.Reque
 
 	if req.ZoneID == "" || len(req.Hostnames) == 0 {
 		respondError(w, http.StatusBadRequest, "zone_id and hostnames are required")
+		return
+	}
+
+	client, err := h.getCFClientForZone(req.ZoneID)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -3098,6 +3714,7 @@ func (h *Handler) listRegistrarDomains(w http.ResponseWriter, r *http.Request) {
 			"domain":       d.Domain,
 			"status":       d.Status,
 			"error_msg":    d.ErrorMsg,
+			"retry_count":  d.RetryCount,
 			"exists":       existingSet[lower],
 			"queued":       d.Status == "pending" || d.Status == "processing",
 			"registrar_id": d.RegistrarID,
@@ -3281,12 +3898,21 @@ func (h *Handler) importRegistrarDomains(w http.ResponseWriter, r *http.Request)
 			Status:      "pending",
 		}
 		if err := h.db.Create(&task).Error; err != nil {
-			results = append(results, map[string]interface{}{
-				"domain":  domain,
-				"status":  "skipped",
-				"message": "已在排队中",
-			})
-			skipCount++
+			if isUniqueConstraintErr(err) {
+				results = append(results, map[string]interface{}{
+					"domain":  domain,
+					"status":  "skipped",
+					"message": "已在排队中",
+				})
+				skipCount++
+			} else {
+				results = append(results, map[string]interface{}{
+					"domain":  domain,
+					"status":  "failed",
+					"message": "入队失败: " + err.Error(),
+				})
+				failCount++
+			}
 			continue
 		}
 
@@ -3314,7 +3940,11 @@ func (h *Handler) importRegistrarDomains(w http.ResponseWriter, r *http.Request)
 
 // listImportTasks 查询导入任务列表
 func (h *Handler) listImportTasks(w http.ResponseWriter, r *http.Request) {
-	registrarID := r.URL.Query().Get("registrar_id")
+	// 路由位于 /registrars/{registrarID}/tasks，优先使用路径参数
+	registrarID := chi.URLParam(r, "registrarID")
+	if registrarID == "" {
+		registrarID = r.URL.Query().Get("registrar_id")
+	}
 	var tasks []models.RegistrarDomain
 	query := h.db.Order("created_at DESC").Limit(200)
 	if registrarID != "" {
@@ -3335,8 +3965,10 @@ func (h *Handler) listImportTasks(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) retryImportTasks(w http.ResponseWriter, r *http.Request) {
 	registrarID, _ := strconv.ParseUint(chi.URLParam(r, "registrarID"), 10, 32)
 	count := h.scheduler.RetryFailed(uint(registrarID))
+	message := fmt.Sprintf("已将 %d 个任务重新加入队列", count)
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"message": fmt.Sprintf("已将 %d 个任务重新加入队列", count),
+		"message": message,
+		"result":  map[string]string{"message": message},
 	})
 }

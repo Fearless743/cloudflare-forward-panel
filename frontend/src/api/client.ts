@@ -40,22 +40,39 @@ api.interceptors.request.use((config) => {
   return config
 })
 
+// 从响应中提取后端错误信息。
+// 兼容后端以 text/plain 返回的 JSON 字符串（历史中间件行为）。
+function extractErrorMessage(data: unknown): string {
+  if (typeof data === 'string') {
+    try {
+      const parsed = JSON.parse(data)
+      if (parsed && typeof parsed.error === 'string') return parsed.error
+    } catch {
+      return data
+    }
+  } else if (data && typeof data === 'object' && 'error' in data) {
+    const err = (data as { error?: unknown }).error
+    if (typeof err === 'string') return err
+  }
+  return ''
+}
+
 // 响应拦截器 - 处理 401 / 403 错误
 api.interceptors.response.use(
   (response) => response,
   (error) => {
+    const serverMessage = extractErrorMessage(error.response?.data)
     if (error.response?.status === 401) {
       localStorage.removeItem('token')
       localStorage.removeItem('user')
       window.location.href = '/login'
     } else if (error.response?.status === 403) {
-      const msg = error.response?.data?.error || ''
       // 首次登录需修改密码：跳转到改密页
-      if (msg.includes('修改密码') || msg.includes('change-password')) {
+      if (serverMessage.includes('修改密码') || serverMessage.includes('change-password')) {
         window.location.href = '/change-password'
       }
     }
-    const message = error.response?.data?.error || error.message || '请求失败'
+    const message = serverMessage || error.message || '请求失败'
     return Promise.reject(new Error(message))
   }
 )
@@ -63,6 +80,9 @@ api.interceptors.response.use(
 // Zones
 export const getZones = () => api.get<CFResponse<Zone[]>>('/zones')
 export const getZone = (id: string) => api.get<CFResponse<Zone>>(`/zones/${id}`)
+// 设置域名的授权用户（仅管理员）
+export const updateZoneUsers = (zoneId: string, userIds: number[]) =>
+  api.put<CFResponse<{ user_ids: number[] }>>(`/zones/${zoneId}/users`, { user_ids: userIds })
 
 // DNS Records
 export const getDNSRecords = (zoneId: string, type?: string) => {

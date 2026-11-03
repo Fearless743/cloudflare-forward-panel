@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -109,9 +110,18 @@ func (s *ImportScheduler) processPending() {
 		// 标记处理中
 		s.db.Model(task).Update("status", "processing")
 
-		// 已存在则跳过
+		// 已存在则跳过；但如果本地有该 Zone 的记录，说明可能是上次 NS 更新失败
+		// （partial），此时应继续补更新 NS，而不是永远跳过。
 		if existingSet[domain] {
-			s.finishTask(task, "skipped", "已在 CF 中", 0)
+			accountID, nsErr := s.updateNameserversForExistingZone(task, domain)
+			switch {
+			case nsErr == nil:
+				s.finishTask(task, "success", "", accountID)
+			case errors.Is(nsErr, errNoLocalZone):
+				s.finishTask(task, "skipped", "已在 CF 中", 0)
+			default:
+				s.finishTask(task, "partial", nsErr.Error(), accountID)
+			}
 			continue
 		}
 
@@ -141,20 +151,7 @@ func (s *ImportScheduler) processPending() {
 			continue
 		}
 
-		// 更新注册商 NS 为 CF 分配的 NS
-		regClient, err := s.getRegistrarClient(task.RegistrarID)
-		if err != nil {
-			s.finishTask(task, "partial", "Zone 已创建，但获取注册商失败: "+err.Error(), client.GetAccountID())
-			continue
-		}
-		if len(zone.NameServers) >= 2 {
-			if err := regClient.UpdateNameservers(domain, zone.NameServers[0], zone.NameServers[1]); err != nil {
-				s.finishTask(task, "partial", "Zone 已创建，但 NS 更新失败: "+err.Error(), client.GetAccountID())
-				continue
-			}
-		}
-
-		// 成功：写入本地 Zone 表，供转发规则使用
+		// 成功创建 Zone 后立即写入本地 Zone 表（即使后续 NS 更新失败也能在重试时找回）
 		localZone := models.Zone{
 			CFID:        zone.ID,
 			AccountID:   client.GetAccountID(),
@@ -167,6 +164,24 @@ func (s *ImportScheduler) processPending() {
 			log.Printf("[ImportScheduler] 写入本地 Zone 失败: %v", err)
 		}
 
+		// 更新注册商 NS 为 CF 分配的 NS
+		regClient, err := s.getRegistrarClient(task.RegistrarID)
+		if err != nil {
+			s.finishTask(task, "partial", "Zone 已创建，但获取注册商失败: "+err.Error(), client.GetAccountID())
+			existingSet[domain] = true
+			continue
+		}
+		if len(zone.NameServers) < 2 {
+			s.finishTask(task, "partial", "Zone 已创建，但 Cloudflare 尚未返回足够 NS，稍后重试", client.GetAccountID())
+			existingSet[domain] = true
+			continue
+		}
+		if err := regClient.UpdateNameservers(domain, zone.NameServers[0], zone.NameServers[1]); err != nil {
+			s.finishTask(task, "partial", "Zone 已创建，但 NS 更新失败: "+err.Error(), client.GetAccountID())
+			existingSet[domain] = true
+			continue
+		}
+
 		// 新接入的 Zone 即开启转发所需设置（幂等，忽略错误）
 		enableZoneForwardingSettings(client, zone.ID)
 
@@ -174,6 +189,66 @@ func (s *ImportScheduler) processPending() {
 		// 记录已存在，避免同批次内重复
 		existingSet[domain] = true
 	}
+}
+
+// errNoLocalZone 表示本地 Zone 表中没有该域名的记录（域名是面板外接入的）。
+var errNoLocalZone = errors.New("本地无该域名的 Zone 记录")
+
+// updateNameserversForExistingZone 用于重试「Zone 已创建但 NS 未更新成功」的任务：
+// 从本地 Zone 表（必要时回源 CF）取 NS 并写入注册商。
+func (s *ImportScheduler) updateNameserversForExistingZone(task *models.RegistrarDomain, domain string) (uint, error) {
+	var zone models.Zone
+	if err := s.db.Where("LOWER(name) = ?", domain).Order("id ASC").First(&zone).Error; err != nil {
+		return 0, errNoLocalZone
+	}
+
+	client, err := s.manager.GetClientByAccountID(zone.AccountID)
+	if err != nil {
+		// 账号可能已被删除，回退到任意可用账号尝试刷新
+		client, err = s.manager.GetClient()
+		if err != nil {
+			return zone.AccountID, err
+		}
+	}
+
+	ns := splitNameServers(zone.NameServers)
+	if len(ns) < 2 && zone.CFID != "" {
+		cfZone, getErr := client.GetZone(zone.CFID)
+		if getErr != nil {
+			return zone.AccountID, fmt.Errorf("获取 Zone NS 失败: %w", getErr)
+		}
+		ns = cfZone.NameServers
+		if len(ns) >= 2 {
+			s.db.Model(&models.Zone{}).Where("id = ?", zone.ID).Updates(map[string]interface{}{
+				"name_servers": strings.Join(ns, ","),
+				"status":       cfZone.Status,
+			})
+		}
+	}
+	if len(ns) < 2 {
+		return zone.AccountID, fmt.Errorf("Cloudflare 尚未分配足够的 NS")
+	}
+
+	regClient, err := s.getRegistrarClient(task.RegistrarID)
+	if err != nil {
+		return zone.AccountID, fmt.Errorf("获取注册商失败: %w", err)
+	}
+	if err := regClient.UpdateNameservers(domain, ns[0], ns[1]); err != nil {
+		return zone.AccountID, fmt.Errorf("NS 更新失败: %w", err)
+	}
+	return zone.AccountID, nil
+}
+
+// splitNameServers 解析本地保存的逗号分隔 NS 列表。
+func splitNameServers(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // getRegistrarClient 根据任务关联的注册商创建客户端

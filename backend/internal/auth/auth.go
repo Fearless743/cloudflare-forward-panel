@@ -32,9 +32,9 @@ func generateJWTSecret() []byte {
 
 // Claims JWT Claims
 type Claims struct {
-	UserID            uint   `json:"user_id"`
-	Username          string `json:"username"`
-	Role              string `json:"role"`
+	UserID             uint   `json:"user_id"`
+	Username           string `json:"username"`
+	Role               string `json:"role"`
 	MustChangePassword bool   `json:"must_change_password"`
 	jwt.RegisteredClaims
 }
@@ -71,6 +71,10 @@ func GenerateToken(userID uint, username, role string, mustChangePassword bool) 
 // ParseToken 解析 JWT Token
 func ParseToken(tokenString string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+		// 只接受 HS256，避免其他签名算法被误用
+		if token.Method != jwt.SigningMethodHS256 {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
 		return jwtSecret, nil
 	})
 

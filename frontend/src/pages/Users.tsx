@@ -80,9 +80,10 @@ function Users() {
       const values = await form.validateFields()
 
       // 处理 DatePicker 的值
+      // 编辑时清空日期需要传空字符串，否则 axios 会丢弃 undefined，后端无法清除订阅
       const subscription = values.subscription
         ? values.subscription.format('YYYY-MM-DD')
-        : undefined
+        : (editingUser ? '' : undefined)
 
       if (editingUser) {
         await updateUser(editingUser.id, {
