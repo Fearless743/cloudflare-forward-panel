@@ -1257,7 +1257,7 @@ func (h *Handler) updateZoneUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 // listLocalZones 返回当前用户可用的本地域名列表（排除被封禁账号），供转发规则表单下拉选择。
-// 管理员可使用全部域名；普通用户只能使用被管理员分配的域名。
+// 所有用户（包括管理员）只能使用被分配的域名。
 func (h *Handler) listLocalZones(w http.ResponseWriter, r *http.Request) {
 	claims := auth.GetUserFromContext(r)
 	if claims == nil {
@@ -1266,7 +1266,7 @@ func (h *Handler) listLocalZones(w http.ResponseWriter, r *http.Request) {
 	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"result":  h.availableLocalZonesForUser(claims.UserID, claims.Role),
+		"result":  h.availableLocalZonesForUser(claims.UserID),
 	})
 }
 
@@ -1544,12 +1544,9 @@ func (h *Handler) authorizedZoneIDs(userID uint) []uint {
 }
 
 // availableLocalZonesForUser 返回用户可用的域名。
-// 管理员可使用全部可用域名；普通用户仅可使用被分配的域名，未分配域名不可用。
-func (h *Handler) availableLocalZonesForUser(userID uint, role string) []models.Zone {
+// 所有用户（包括管理员）都只能使用被分配的域名；未分配域名不可用。
+func (h *Handler) availableLocalZonesForUser(userID uint) []models.Zone {
 	zones := h.availableLocalZones()
-	if role == "admin" {
-		return zones
-	}
 
 	ids := h.authorizedZoneIDs(userID)
 	if len(ids) == 0 {
@@ -1569,27 +1566,21 @@ func (h *Handler) availableLocalZonesForUser(userID uint, role string) []models.
 	return filtered
 }
 
-// userCanUseZone 判断用户是否可使用某个本地 Zone（管理员始终可用）。
-func (h *Handler) userCanUseZone(userID uint, role string, zoneID uint) bool {
-	if role == "admin" {
-		return true
-	}
+// userCanUseZone 判断用户是否可使用某个本地 Zone（包括管理员也需被分配）。
+func (h *Handler) userCanUseZone(userID uint, zoneID uint) bool {
 	var count int64
 	h.db.Model(&models.ZoneUser{}).Where("zone_id = ? AND user_id = ?", zoneID, userID).Count(&count)
 	return count > 0
 }
 
 // userCanUseZoneCFID 按 Cloudflare Zone ID 判断用户的域名使用权限。
-// 普通用户遇到本地不存在的 Zone 时视为无权使用。
-func (h *Handler) userCanUseZoneCFID(userID uint, role string, cfid string) bool {
-	if role == "admin" {
-		return true
-	}
+// 本地不存在的 Zone 视为无权使用。
+func (h *Handler) userCanUseZoneCFID(userID uint, cfid string) bool {
 	var zone models.Zone
 	if err := h.db.Where("cf_id = ?", cfid).First(&zone).Error; err != nil {
 		return false
 	}
-	return h.userCanUseZone(userID, role, zone.ID)
+	return h.userCanUseZone(userID, zone.ID)
 }
 
 // enableZoneForwardingSettings 开启转发所需的 Zone 设置：SSL Full、WebSockets、gRPC。
@@ -1644,7 +1635,7 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 			respondError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if !h.userCanUseZone(claims.UserID, claims.Role, z.ID) {
+		if !h.userCanUseZone(claims.UserID, z.ID) {
 			respondError(w, http.StatusForbidden, "无权使用该域名，请联系管理员分配")
 			return
 		}
@@ -1655,8 +1646,8 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 	// 并为这个新目标插入一行独立的 ForwardRule（共享同一 CF 规则）。
 	// 端口全局唯一：任意用户创建已存在的端口都复用同一条规则。
 	if existing := h.findExistingRuleForPort(req.OriginPort); existing != nil {
-		// 普通用户不能借用未分配给自己的域名
-		if !h.userCanUseZoneCFID(claims.UserID, claims.Role, existing.ZoneID) {
+		// 所有用户（包括管理员）都不能借用未分配给自己的域名
+		if !h.userCanUseZoneCFID(claims.UserID, existing.ZoneID) {
 			respondError(w, http.StatusForbidden, "该端口已绑定域名 "+existing.ZoneName+"，无权使用该域名")
 			return
 		}
@@ -1737,7 +1728,7 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 		bestZone = *selectedZone
 	} else {
 		// 自动选择可用的域名（优先填满一个域名）
-		availableZones := h.availableLocalZonesForUser(claims.UserID, claims.Role)
+		availableZones := h.availableLocalZonesForUser(claims.UserID)
 		if len(availableZones) == 0 {
 			respondError(w, http.StatusBadRequest, "没有可用的域名，请联系管理员分配域名或解除账号封禁")
 			return
@@ -2116,19 +2107,19 @@ func (h *Handler) updateForwardRule(w http.ResponseWriter, r *http.Request) {
 			respondError(w, http.StatusForbidden, "订阅已过期，无法修改转发规则")
 			return
 		}
+	}
 
-		// 普通用户只能把规则迁移到被分配的域名
-		if req.ZoneID != "" && req.ZoneID != localRule.ZoneID && !h.userCanUseZoneCFID(claims.UserID, claims.Role, req.ZoneID) {
-			respondError(w, http.StatusForbidden, "无权使用该域名，请联系管理员分配")
-			return
-		}
-		// 改端口时会复用该端口已有的共享规则，需确认用户对目标域名有权限
-		if req.OriginPort != localRule.OriginPort {
-			if existing := h.findExistingRuleForPortExcluding(req.OriginPort, localRule.ID); existing != nil && existing.CFRuleSetID != "" {
-				if !h.userCanUseZoneCFID(claims.UserID, claims.Role, existing.ZoneID) {
-					respondError(w, http.StatusForbidden, "该端口已绑定域名 "+existing.ZoneName+"，无权使用该域名")
-					return
-				}
+	// 所有用户（包括管理员）只能使用被分配的域名：
+	// 迁移规则到其它域名、或改端口复用其它域名的共享规则时都需校验权限。
+	if req.ZoneID != "" && req.ZoneID != localRule.ZoneID && !h.userCanUseZoneCFID(claims.UserID, req.ZoneID) {
+		respondError(w, http.StatusForbidden, "无权使用该域名，请联系管理员分配")
+		return
+	}
+	if req.OriginPort != localRule.OriginPort {
+		if existing := h.findExistingRuleForPortExcluding(req.OriginPort, localRule.ID); existing != nil && existing.CFRuleSetID != "" {
+			if !h.userCanUseZoneCFID(claims.UserID, existing.ZoneID) {
+				respondError(w, http.StatusForbidden, "该端口已绑定域名 "+existing.ZoneName+"，无权使用该域名")
+				return
 			}
 		}
 	}

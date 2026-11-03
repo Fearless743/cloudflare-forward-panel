@@ -171,7 +171,7 @@ function Zones() {
         <Alert
           type="info"
           showIcon
-          message="普通用户只能使用分配给自己的域名；未分配或清空后仅管理员可用。"
+          message="所有用户（包括管理员）只能使用分配给自己的域名；未分配的域名不可用。"
           style={{ marginBottom: 16 }}
         />
         <Select

@@ -52,7 +52,7 @@ type Zone struct {
 }
 
 // ZoneUser 域名与用户的授权关系（多对多）：将特定域名分配给特定用户。
-// 普通用户只能使用被分配的域名；管理员不受限制。未分配域名仅管理员可用。
+// 所有用户（包括管理员）都只能使用被分配的域名，未分配域名不可用。
 type ZoneUser struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	ZoneID    uint      `gorm:"uniqueIndex:idx_zone_user" json:"zone_id"` // 本地 Zone 主键

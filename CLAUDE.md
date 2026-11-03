@@ -57,11 +57,11 @@ frontend (Vite/React18/AntD5, TS)  ——HTTP /api——>  backend (Go/chi)
 
 5. **配置来源**：`config.Load()` 只读两个环境变量 `DB_PATH`、`SERVER_PORT`（见 `.env.example`）。**CF 凭证和 Telegram 配置不读 `.env`**——CF 账号存在 `CFAccount` 表（Global API Key + email，通过 `X-Auth-Key`/`X-Auth-Email` 头认证），Telegram bot token 存在 `Setting` 键值表。
 
-6. **域名分配（`ZoneUser`）**：管理员在「域名管理」页把域名分配给一个或多个用户。`/api/forward-rules/zones` 与自动选域逻辑只返回当前用户被分配的域名（管理员不受限），未分配域名对普通用户不可用；创建/编辑规则时校验目标域名权限。
+6. **域名分配（`ZoneUser`）**：管理员在「域名管理」页把域名分配给一个或多个用户（管理员也可分配给自己）。`/api/forward-rules/zones` 与自动选域逻辑只返回当前用户被分配的域名，未分配域名对所有人不可用；创建/编辑规则时校验目标域名权限。
 
 ### 数据模型（`internal/models/models.go`）
 
-`User`（含订阅过期时间 `subscription`，nil 表永久）、`Setting`（KV 配置）、`CFAccount`（多账号凭证）、`Zone`（本地镜像 CF Zone，供转发规则用）、`ZoneUser`（域名→用户的多对多授权，普通用户仅能使用被分配的域名，未分配域名仅管理员可用）、`ForwardRule`（转发规则，关联 CF ruleset/dns ID）、`DomainRegistrar`（注册商配置）、`RegistrarDomain`（导入队列）。启动时 `AutoMigrate` 全部模型。
+`User`（含订阅过期时间 `subscription`，nil 表永久）、`Setting`（KV 配置）、`CFAccount`（多账号凭证）、`Zone`（本地镜像 CF Zone，供转发规则用）、`ZoneUser`（域名→用户的多对多授权，所有用户包括管理员都仅能使用被分配的域名）、`ForwardRule`（转发规则，关联 CF ruleset/dns ID）、`DomainRegistrar`（注册商配置）、`RegistrarDomain`（导入队列）。启动时 `AutoMigrate` 全部模型。
 
 ## 注意事项
 
