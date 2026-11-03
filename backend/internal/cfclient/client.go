@@ -20,8 +20,8 @@ const baseURL = "https://api.cloudflare.com/client/v4"
 
 type Client struct {
 	httpClient        *http.Client
-	apiKey            string // 账户级 API Token
-	email             string // 登录邮箱（仅作账号标识，认证不再使用）
+	apiKey            string // Global API Key
+	email             string // 登录邮箱
 	accountID         uint
 	accountIdentifier string // CF 账号 ID（创建 Zone 时用于指定 account 参数）
 	accountName       string
@@ -102,12 +102,12 @@ type SSLSetting struct {
 	Editable bool   `json:"editable"`
 }
 
-// NewClient 创建客户端（账户级 API Token 认证，Authorization: Bearer）
+// NewClient 创建客户端（Global API Key 认证）
 func NewClient(apiKey, email string) *Client {
 	return &Client{
 		httpClient: &http.Client{Timeout: 30 * time.Second},
-		apiKey:     strings.TrimSpace(apiKey),
-		email:      strings.TrimSpace(email),
+		apiKey:     apiKey,
+		email:      email,
 	}
 }
 
@@ -121,9 +121,11 @@ func (c *Client) SetAccountIdentifier(id string) {
 	c.accountIdentifier = id
 }
 
-// setAuthHeaders 设置 API Token 认证请求头：Authorization: Bearer <token>
+// setAuthHeaders 设置 Global API Key 认证请求头
+// X-Auth-Key=<Global API Key> + X-Auth-Email=<登录邮箱>
 func (c *Client) setAuthHeaders(req *http.Request) {
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("X-Auth-Key", c.apiKey)
+	req.Header.Set("X-Auth-Email", c.email)
 }
 
 func (c *Client) doRequest(method, path string, body interface{}) (*CFResponse, error) {
@@ -141,8 +143,12 @@ func (c *Client) doRequest(method, path string, body interface{}) (*CFResponse, 
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	// 调试日志：不打印凭证内容
-	log.Printf("[CF API] %s %s, account: %s, auth: api_token", method, path, c.email)
+	// 调试日志：只显示 api key 前缀，避免泄露完整密钥
+	keyPrefix := c.apiKey
+	if len(keyPrefix) > 4 {
+		keyPrefix = keyPrefix[:4] + "..."
+	}
+	log.Printf("[CF API] %s %s, email: %s, key prefix: %s", method, path, c.email, keyPrefix)
 
 	req.Header.Set("Content-Type", "application/json")
 	c.setAuthHeaders(req)
@@ -257,6 +263,16 @@ func (c *Client) CreateZone(domain string) (*Zone, error) {
 		return nil, err
 	}
 	return &zone, nil
+}
+
+// parseTokenAccountID 尝试从 CF API Token 中解析 account_id
+// 若 token 前缀为 "cfat_"，则后面的字符串即为账号 ID
+func parseTokenAccountID(token string) string {
+	const prefix = "cfat_"
+	if strings.HasPrefix(token, prefix) && len(token) > len(prefix) {
+		return token[len(prefix):]
+	}
+	return ""
 }
 
 // DNS Records

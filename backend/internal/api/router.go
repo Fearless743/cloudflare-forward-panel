@@ -864,8 +864,11 @@ func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apiKey := strings.TrimSpace(req.APIKey)
-	if apiKey == "" {
+	if req.Email == "" {
+		respondError(w, http.StatusBadRequest, "email is required")
+		return
+	}
+	if req.APIKey == "" {
 		respondError(w, http.StatusBadRequest, "api_key is required")
 		return
 	}
@@ -878,7 +881,7 @@ func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
 	account := models.CFAccount{
 		Name:      name,
 		Email:     strings.TrimSpace(req.Email),
-		APIKey:    apiKey,
+		APIKey:    strings.TrimSpace(req.APIKey),
 		AccountID: strings.TrimSpace(req.AccountID),
 		IsActive:  true,
 	}

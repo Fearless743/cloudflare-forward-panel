@@ -134,7 +134,7 @@ export interface CFAccount {
 }
 export const getAccounts = () =>
   api.get<CFResponse<CFAccount[]>>('/accounts')
-export const createAccount = (data: { email?: string; api_key: string; account_id?: string }) =>
+export const createAccount = (data: { email: string; api_key: string; account_id?: string }) =>
   api.post<CFResponse<CFAccount>>('/accounts', data)
 export const updateAccount = (id: number, data: { email?: string; api_key?: string; account_id?: string }) =>
   api.put<CFResponse<{ message: string }>>(`/accounts/${id}`, data)
