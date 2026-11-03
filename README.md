@@ -4,7 +4,7 @@
 
 ## 功能特性
 
-- **多账号轮询**：支持多个 Cloudflare 账号（Global API Key），请求失败自动切换；账号封禁时自动迁移其名下转发规则到其他账号
+- **多账号轮询**：支持多个 Cloudflare 账号（账户级 API Token），请求失败自动切换；账号封禁时自动迁移其名下转发规则到其他账号
 - **域名管理**：查看 Cloudflare 账户下的所有域名、NS 服务器与套餐信息
 - **DNS 记录**：A、AAAA、CNAME、MX、TXT 等记录类型的增删改查
 - **端口转发**：基于 Cloudflare Origin Rules，自动生成随机子域名 + DNS 记录 + SSL 全量模式；同端口多目标复用同一条规则
@@ -35,7 +35,7 @@ DB_PATH=./data/cloudflare.db
 SERVER_PORT=8080
 ```
 
-> **注意**：Cloudflare 凭证（Global API Key + 邮箱）、Telegram Bot Token 均存在数据库里，通过面板的「账号管理」「系统设置」页面配置，不读 `.env`。
+> **注意**：Cloudflare 凭证（账户级 API Token）、Telegram Bot Token 均存在数据库里，通过面板的「账号管理」「系统设置」页面配置，不读 `.env`。
 
 ### 本地开发
 

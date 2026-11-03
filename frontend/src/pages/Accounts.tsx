@@ -40,8 +40,6 @@ function Accounts() {
   const handleEdit = (account: CFAccount) => {
     setEditingAccount(account)
     form.setFieldsValue({
-      name: account.name,
-      email: account.email,
       api_key: account.api_key,
       account_id: account.account_id,
     })
@@ -91,14 +89,12 @@ function Accounts() {
 
       if (editingAccount) {
         await updateAccount(editingAccount.id, {
-          email: values.email,
           api_key: values.api_key,
           account_id: values.account_id || undefined,
         })
         message.success('更新成功')
       } else {
         await createAccount({
-          email: values.email,
           api_key: values.api_key,
           account_id: values.account_id || undefined,
         })
@@ -126,18 +122,13 @@ function Accounts() {
   const columns = [
     {
       title: '账号名称',
-      dataIndex: 'name',
       key: 'name',
-      render: (text: string) => <Text strong>{text}</Text>,
+      render: (_: unknown, record: CFAccount) => (
+        <Text strong>{record.email || record.name}</Text>
+      ),
     },
     {
-      title: '邮箱',
-      dataIndex: 'email',
-      key: 'email',
-      render: (text: string) => <Text>{text || '-'}</Text>,
-    },
-    {
-      title: 'API Key',
+      title: 'API Token',
       dataIndex: 'api_key',
       key: 'api_key',
       render: (text: string) => <Text code>{text}</Text>,
@@ -237,18 +228,12 @@ function Accounts() {
       >
         <Form form={form} layout="vertical">
           <Form.Item
-            name="email"
-            label="登录邮箱"
-            rules={[{ required: true, message: '请输入 CF 登录邮箱' }]}
-          >
-            <Input placeholder="your@email.com" />
-          </Form.Item>
-          <Form.Item
             name="api_key"
-            label="Global API Key"
-            rules={[{ required: true, message: '请输入 Global API Key' }]}
+            label="账户级 API Token"
+            tooltip="Cloudflare 控制台 → 管理账户 → 账户 API 令牌，新建的令牌以 cfat_ 开头"
+            rules={[{ required: true, message: '请输入账户级 API Token' }]}
           >
-            <Input.Password placeholder="在 CF 控制台 - 我的资料 - API 令牌中查看" />
+            <Input.Password placeholder="cfat_..." />
           </Form.Item>
           <Form.Item
             name="account_id"

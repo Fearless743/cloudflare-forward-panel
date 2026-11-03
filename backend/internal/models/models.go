@@ -24,12 +24,12 @@ type Setting struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// CFAccount 存储多个 Cloudflare 账号凭证（Global API Key）
+// CFAccount 存储多个 Cloudflare 账号凭证（账户级 API Token）
 type CFAccount struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	Name      string    `json:"name"`                     // 账号名称（便于识别）
-	Email     string    `json:"email"`                    // 登录邮箱
-	APIKey    string    `json:"api_key"`                  // Global API Key
+	Email     string    `json:"email"`                    // 登录邮箱（仅作账号标识）
+	APIKey    string    `json:"api_key"`                  // 账户级 API Token（cfat_ 前缀）
 	AccountID string    `json:"account_id"`               // CF 账号 ID（创建 Zone 时指定）
 	IsActive  bool      `json:"is_active" gorm:"default:true"`  // 是否启用
 	IsBlocked bool      `json:"is_blocked" gorm:"default:false"` // 是否被封禁

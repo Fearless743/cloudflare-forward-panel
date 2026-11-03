@@ -55,7 +55,7 @@ frontend (Vite/React18/AntD5, TS)  ——HTTP /api——>  backend (Go/chi)
 
 4. **认证**：JWT（HS256，`Authorization: Bearer <token>`）。**secret 硬编码**在 `auth/auth.go` 中（`cf-panel-secret-key-change-in-production`）。角色 `admin`/`user`，通过 `auth.Middleware` / `auth.AdminMiddleware` 区分。默认管理员 `admin / admin123`（首次启动自动创建）。
 
-5. **配置来源**：`config.Load()` 只读两个环境变量 `DB_PATH`、`SERVER_PORT`（见 `.env.example`）。**CF 凭证和 Telegram 配置不读 `.env`**——CF 账号存在 `CFAccount` 表（Global API Key + email，通过 `X-Auth-Key`/`X-Auth-Email` 头认证），Telegram bot token 存在 `Setting` 键值表。
+5. **配置来源**：`config.Load()` 只读两个环境变量 `DB_PATH`、`SERVER_PORT`（见 `.env.example`）。**CF 凭证和 Telegram 配置不读 `.env`**——CF 账号存在 `CFAccount` 表（账户级 API Token，通过 `Authorization: Bearer` 头认证），Telegram bot token 存在 `Setting` 键值表。
 
 ### 数据模型（`internal/models/models.go`）
 
@@ -64,5 +64,5 @@ frontend (Vite/React18/AntD5, TS)  ——HTTP /api——>  backend (Go/chi)
 ## 注意事项
 
 - **README.md 已过时**：其技术栈（写的是 npm、`CF_API_EMAIL/CF_API_KEY` 环境变量）、API 端点表与实际代码不符。以代码为准——实际用 bun、CF 凭证存数据库、端点见 `router.go`。
-- CF API 用 **Global API Key**（`X-Auth-Key` + `X-Auth-Email`），非 API Token。错误码字符串形如 `[9106] message`，manager 依赖此格式解析封禁。
+- CF API 用 **账户级 API Token**（`Authorization: Bearer <token>`，新格式 `cfat_` 前缀）。错误码字符串形如 `[9106] message`，manager 依赖此格式解析封禁。
 - 敏感字段（API key、secret）在返回前会在 handler 中做掩码处理；更新时跳过含 `****` 的值。
