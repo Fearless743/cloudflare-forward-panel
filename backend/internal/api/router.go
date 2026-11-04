@@ -1659,20 +1659,28 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 		selectedZone = z
 	}
 
-	// 端口相同则复用已有的 Origin Rule：把新主机名并入该规则的表达式，
-	// 并为这个新目标插入一行独立的 ForwardRule（共享同一 CF 规则）。
-	// 端口全局唯一：任意用户创建已存在的端口都复用同一条规则。
-	if existing := h.findExistingRuleForPort(req.OriginPort); existing != nil {
-		// 所有用户（包括管理员）都不能借用未分配给自己的域名
-		if !h.userCanUseZoneCFID(claims.UserID, existing.ZoneID) {
-			respondError(w, http.StatusForbidden, "该端口已绑定域名 "+existing.ZoneName+"，无权使用该域名")
+	// 未指定域名时提前取出当前用户可用域名，用于端口复用范围与后续自动选域。
+	var userZones []models.Zone
+	if selectedZone == nil {
+		userZones = h.availableLocalZonesForUser(claims.UserID)
+		if len(userZones) == 0 {
+			respondError(w, http.StatusBadRequest, "没有可用的域名，请联系管理员分配域名或解除账号封禁")
 			return
 		}
-		// 用户显式指定域名但端口已绑定到其他域名 → 报错
-		if selectedZone != nil && selectedZone.CFID != existing.ZoneID {
-			respondError(w, http.StatusBadRequest, "该端口已绑定域名 "+existing.ZoneName+"，无法指定其他域名")
-			return
+	}
+
+	// 端口在「同一 Zone（域名）」内唯一：同 Zone 同端口复用一条 CF Origin Rule，
+	// 不同 Zone 之间端口互不影响（Cloudflare Origin Rule 本身按 Zone 隔离）。
+	// 只在当前用户有权使用的 Zone 内查找，避免借用他人域名。
+	var reuseZoneIDs []string
+	if selectedZone != nil {
+		reuseZoneIDs = append(reuseZoneIDs, selectedZone.CFID)
+	} else {
+		for _, z := range userZones {
+			reuseZoneIDs = append(reuseZoneIDs, z.CFID)
 		}
+	}
+	if existing := h.findExistingRuleForPortInZones(req.OriginPort, reuseZoneIDs, 0); existing != nil {
 		newHostname, dnsRecordID, err := h.addHostnameToRule(existing, req.OriginHost)
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, err.Error())
@@ -1745,7 +1753,7 @@ func (h *Handler) createForwardRule(w http.ResponseWriter, r *http.Request) {
 		bestZone = *selectedZone
 	} else {
 		// 自动选择可用的域名（优先填满一个域名）
-		availableZones := h.availableLocalZonesForUser(claims.UserID)
+		availableZones := userZones
 		if len(availableZones) == 0 {
 			respondError(w, http.StatusBadRequest, "没有可用的域名，请联系管理员分配域名或解除账号封禁")
 			return
@@ -2133,19 +2141,11 @@ func (h *Handler) updateForwardRule(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 所有用户（包括管理员）只能使用被分配的域名：
-	// 迁移规则到其它域名、或改端口复用其它域名的共享规则时都需校验权限。
+	// 所有用户（包括管理员）只能把规则迁移到被分配的域名。
+	// 端口复用范围由 reconfigureForwardRule 限定在目标 Zone 内，不会跨域名抢占端口。
 	if req.ZoneID != "" && req.ZoneID != localRule.ZoneID && !h.userCanUseZoneCFID(claims.UserID, req.ZoneID) {
 		respondError(w, http.StatusForbidden, "无权使用该域名，请联系管理员分配")
 		return
-	}
-	if req.OriginPort != localRule.OriginPort {
-		if existing := h.findExistingRuleForPortExcluding(req.OriginPort, localRule.ID); existing != nil && existing.CFRuleSetID != "" {
-			if !h.userCanUseZoneCFID(claims.UserID, existing.ZoneID) {
-				respondError(w, http.StatusForbidden, "该端口已绑定域名 "+existing.ZoneName+"，无权使用该域名")
-				return
-			}
-		}
 	}
 
 	// 端口/域名变更需要重建或迁移 CF 资源；仅改目标地址时才走原地更新。
@@ -2207,25 +2207,12 @@ func (h *Handler) updateForwardRule(w http.ResponseWriter, r *http.Request) {
 }
 
 // reconfigureForwardRule 处理规则的端口/域名变更。
-// 端口在面板内是「共享维度」：同端口的多条目标共享一条 CF Origin Rule。
-// 因此改端口时优先并入该端口已有的规则；独占旧规则时可直接改端口；
-// 旧规则被多个目标共享时则为新端口拆出一条独立规则。
+// 端口在「同一 Zone」内是共享维度：同 Zone 同端口的多条目标共享一条 CF Origin Rule；
+// 不同 Zone 之间端口互不影响。因此改端口时只在目标 Zone 内查找可复用的规则。
 func (h *Handler) reconfigureForwardRule(rule *models.ForwardRule, newPort int, newHost string, enabled bool, requestedZoneID string) error {
 	old := *rule
-	oldClient, err := h.getCFClientForAccount(old.AccountID)
-	if err != nil {
-		return err
-	}
 
-	// 1) 新端口已有其他本地规则：并入该端口的共享规则（必要时跟随其 zone）
-	if existing := h.findExistingRuleForPortExcluding(newPort, old.ID); existing != nil && existing.CFRuleSetID != "" {
-		if requestedZoneID != "" && requestedZoneID != existing.ZoneID {
-			return fmt.Errorf("该端口已绑定域名 %s，无法指定其他域名", existing.ZoneName)
-		}
-		return h.mergeRuleIntoExistingPort(&old, existing, newHost, enabled)
-	}
-
-	// 2) 解析目标 zone
+	// 1) 先解析目标 zone（未指定或与当前相同时沿用旧 zone）
 	targetZone := models.Zone{CFID: old.ZoneID, Name: old.ZoneName, AccountID: old.AccountID}
 	if requestedZoneID != "" && requestedZoneID != old.ZoneID {
 		z, err := h.findAvailableZoneByCFID(requestedZoneID)
@@ -2233,6 +2220,16 @@ func (h *Handler) reconfigureForwardRule(rule *models.ForwardRule, newPort int, 
 			return err
 		}
 		targetZone = *z
+	}
+
+	// 2) 目标 Zone 内已有同端口规则：并入该端口的共享规则
+	if existing := h.findExistingRuleForPortInZones(newPort, []string{targetZone.CFID}, old.ID); existing != nil && existing.CFRuleSetID != "" {
+		return h.mergeRuleIntoExistingPort(&old, existing, newHost, enabled)
+	}
+
+	oldClient, err := h.getCFClientForAccount(old.AccountID)
+	if err != nil {
+		return err
 	}
 
 	// 3) 同 zone：原地改端口或从共享规则中拆分
@@ -2964,15 +2961,15 @@ func buildHostExpression(hostnames []string) string {
 	return "(" + strings.Join(parts, " or ") + ")"
 }
 
-// findExistingRuleForPort 按端口查找已存在的规则（端口全局唯一，同端口复用）
-func (h *Handler) findExistingRuleForPort(port int) *models.ForwardRule {
-	return h.findExistingRuleForPortExcluding(port, 0)
-}
-
-// findExistingRuleForPortExcluding 按端口查找规则，可排除指定本地行（用于编辑时忽略自身）。
-func (h *Handler) findExistingRuleForPortExcluding(port int, excludeID uint) *models.ForwardRule {
+// findExistingRuleForPortInZones 在指定 Zone 集合内按端口查找规则，可排除指定本地行。
+// 端口在面板内按 Zone 唯一：同一 Zone 同端口复用一条 CF Origin Rule；
+// 不同 Zone 之间端口互不影响（Cloudflare Origin Rule 本身按 Zone 隔离）。
+func (h *Handler) findExistingRuleForPortInZones(port int, zoneIDs []string, excludeID uint) *models.ForwardRule {
+	if len(zoneIDs) == 0 {
+		return nil
+	}
 	var rule models.ForwardRule
-	query := h.db.Where("origin_port = ?", port)
+	query := h.db.Where("origin_port = ? AND zone_id IN ?", port, zoneIDs)
 	if excludeID != 0 {
 		query = query.Where("id != ?", excludeID)
 	}

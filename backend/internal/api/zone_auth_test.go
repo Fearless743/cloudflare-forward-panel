@@ -117,3 +117,33 @@ func TestListForwardRulesOnlyOwn(t *testing.T) {
 		}
 	}
 }
+
+func TestFindExistingRuleForPortInZones(t *testing.T) {
+	h := newTestHandler(t)
+	if err := h.db.AutoMigrate(&models.ForwardRule{}); err != nil {
+		t.Fatalf("migrate forward rules: %v", err)
+	}
+
+	rules := []models.ForwardRule{
+		{UserID: 1, ZoneID: "cf-a", ZoneName: "a.example.com", Hostname: "a1.a.example.com", OriginPort: 8080},
+		{UserID: 2, ZoneID: "cf-b", ZoneName: "b.example.com", Hostname: "b1.b.example.com", OriginPort: 8080},
+	}
+	for i := range rules {
+		if err := h.db.Create(&rules[i]).Error; err != nil {
+			t.Fatalf("create rule: %v", err)
+		}
+	}
+
+	if got := h.findExistingRuleForPortInZones(8080, []string{"cf-b"}, 0); got == nil || got.ZoneID != "cf-b" {
+		t.Fatalf("zone B lookup = %+v, want cf-b", got)
+	}
+	if got := h.findExistingRuleForPortInZones(8080, []string{"cf-a"}, 0); got == nil || got.ZoneID != "cf-a" {
+		t.Fatalf("zone A lookup = %+v, want cf-a", got)
+	}
+	if got := h.findExistingRuleForPortInZones(8080, []string{"cf-c"}, 0); got != nil {
+		t.Fatalf("zone C lookup = %+v, want nil", got)
+	}
+	if got := h.findExistingRuleForPortInZones(9999, []string{"cf-a", "cf-b"}, 0); got != nil {
+		t.Fatalf("unused port lookup = %+v, want nil", got)
+	}
+}
