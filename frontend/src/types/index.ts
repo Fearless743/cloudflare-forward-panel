@@ -5,6 +5,8 @@ export interface Zone {
   name_servers: string[]
   plan: { name: string }
   created_on: string
+  account_id?: number
+  account_name?: string
   user_ids?: number[]
   usernames?: string[]
 }

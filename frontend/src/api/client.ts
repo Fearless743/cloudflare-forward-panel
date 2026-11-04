@@ -80,6 +80,9 @@ api.interceptors.response.use(
 // Zones
 export const getZones = () => api.get<CFResponse<Zone[]>>('/zones')
 export const getZone = (id: string) => api.get<CFResponse<Zone>>(`/zones/${id}`)
+// 手动添加域名到指定 CF 账号（不经过注册商）
+export const createZone = (data: { account_id: number; domain: string }) =>
+  api.post<CFResponse<Zone> & { existed: boolean; account_id: number; account_name: string }>('/zones', data)
 // 设置域名的授权用户（仅管理员）
 export const updateZoneUsers = (zoneId: string, userIds: number[]) =>
   api.put<CFResponse<{ user_ids: number[] }>>(`/zones/${zoneId}/users`, { user_ids: userIds })

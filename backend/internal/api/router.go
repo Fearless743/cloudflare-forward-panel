@@ -9,6 +9,7 @@ import (
 	"cloudflare-forward-panel/internal/telegram"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -360,6 +361,7 @@ func (h *Handler) Router() *chi.Mux {
 				// 域名管理
 				r.Route("/zones", func(r chi.Router) {
 					r.Get("/", h.listZones)
+					r.Post("/", h.createZone) // 手动添加域名到指定账号（不经过注册商）
 					r.Get("/{zoneID}", h.getZone)
 					r.Put("/{zoneID}/users", h.updateZoneUsers) // 分配域名给用户
 
@@ -1158,11 +1160,13 @@ func (h *Handler) listZones(w http.ResponseWriter, r *http.Request) {
 
 	zones := h.manager.ListAllZones()
 
-	// 附加域名已分配的用户，供管理页面展示与编辑
+	// 附加域名已分配的用户与所属账号，供管理页面展示与编辑
 	type zoneWithUsers struct {
 		cfclient.Zone
-		UserIDs   []uint   `json:"user_ids"`
-		Usernames []string `json:"usernames"`
+		AccountID   uint     `json:"account_id"`
+		AccountName string   `json:"account_name"`
+		UserIDs     []uint   `json:"user_ids"`
+		Usernames   []string `json:"usernames"`
 	}
 
 	cfIDs := make([]string, 0, len(zones))
@@ -1174,11 +1178,18 @@ func (h *Handler) listZones(w http.ResponseWriter, r *http.Request) {
 	if len(cfIDs) > 0 {
 		h.db.Where("cf_id IN ?", cfIDs).Find(&localZones)
 	}
-	cfIDToLocalID := make(map[string]uint, len(localZones))
+	cfIDToLocalZone := make(map[string]models.Zone, len(localZones))
 	localIDs := make([]uint, 0, len(localZones))
 	for _, z := range localZones {
-		cfIDToLocalID[z.CFID] = z.ID
+		cfIDToLocalZone[z.CFID] = z
 		localIDs = append(localIDs, z.ID)
+	}
+
+	var cfAccounts []models.CFAccount
+	h.db.Select("id", "name").Find(&cfAccounts)
+	accountNames := make(map[uint]string, len(cfAccounts))
+	for _, acc := range cfAccounts {
+		accountNames[acc.ID] = acc.Name
 	}
 
 	assignmentsByZone := make(map[uint][]uint)
@@ -1200,8 +1211,10 @@ func (h *Handler) listZones(w http.ResponseWriter, r *http.Request) {
 	result := make([]zoneWithUsers, 0, len(zones))
 	for _, z := range zones {
 		item := zoneWithUsers{Zone: z, UserIDs: []uint{}, Usernames: []string{}}
-		if localID, ok := cfIDToLocalID[z.ID]; ok {
-			for _, uid := range assignmentsByZone[localID] {
+		if localZone, ok := cfIDToLocalZone[z.ID]; ok {
+			item.AccountID = localZone.AccountID
+			item.AccountName = accountNames[localZone.AccountID]
+			for _, uid := range assignmentsByZone[localZone.ID] {
 				item.UserIDs = append(item.UserIDs, uid)
 				item.Usernames = append(item.Usernames, usernameByID[uid])
 			}
@@ -1212,6 +1225,137 @@ func (h *Handler) listZones(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"result":  result,
+	})
+}
+
+// domainNameRegexp 校验根域名格式（至少包含一个点，允许 punycode）。
+var domainNameRegexp = regexp.MustCompile(`^(?i)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
+
+// createZone 手动把域名接入指定 CF 账号，不经过注册商 API。
+// 只在 Cloudflare 创建 Zone 并记录本地归属，NS 需要用户自行到域名注册商处修改。
+func (h *Handler) createZone(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AccountID uint   `json:"account_id"`
+		Domain    string `json:"domain"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.AccountID == 0 {
+		respondError(w, http.StatusBadRequest, "请选择要添加到的 CF 账号")
+		return
+	}
+
+	domain := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(req.Domain)), ".")
+	if len(domain) > 253 || !domainNameRegexp.MatchString(domain) {
+		respondError(w, http.StatusBadRequest, "域名格式不正确，请输入根域名，例如 example.com")
+		return
+	}
+
+	var account models.CFAccount
+	if err := h.db.Where("id = ?", req.AccountID).First(&account).Error; err != nil {
+		respondError(w, http.StatusNotFound, "CF 账号不存在")
+		return
+	}
+	if account.IsBlocked {
+		respondError(w, http.StatusBadRequest, "该账号已被封禁，无法添加域名")
+		return
+	}
+
+	client, err := h.getCFClientForAccount(account.ID)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// 目标账号已有同名 Zone 时直接复用（可能是在 CF 控制台手动接入的），
+	// 避免重复创建报错，同时补齐本地归属记录。
+	zones, err := client.ListAllZones()
+	if err != nil {
+		respondError(w, http.StatusBadGateway, "查询账号域名失败: "+err.Error())
+		return
+	}
+	var zone *cfclient.Zone
+	for i := range zones {
+		if strings.EqualFold(zones[i].Name, domain) {
+			zone = &zones[i]
+			break
+		}
+	}
+	existed := zone != nil
+
+	if zone == nil {
+		// 已接入其他账号的域名不允许重复添加（多账号下会产生归属歧义）
+		var other models.Zone
+		if err := h.db.Where("LOWER(name) = ? AND account_id <> ?", domain, account.ID).
+			Order("id ASC").First(&other).Error; err == nil {
+			otherName := fmt.Sprintf("账号 %d", other.AccountID)
+			var otherAccount models.CFAccount
+			if h.db.Select("name").Where("id = ?", other.AccountID).First(&otherAccount).Error == nil && otherAccount.Name != "" {
+				otherName = otherAccount.Name
+			}
+			respondError(w, http.StatusConflict, fmt.Sprintf("域名已存在于 %s，不能重复添加", otherName))
+			return
+		}
+
+		created, createErr := client.CreateZone(domain)
+		if createErr != nil {
+			respondError(w, http.StatusBadGateway, "创建 Zone 失败: "+createErr.Error())
+			return
+		}
+		zone = created
+	}
+
+	// 写入/更新本地 Zone 镜像：多账号场景下必须记录归属，
+	// 后续 DNS、SSL 和转发操作才能使用正确的账号凭证。
+	localZone := models.Zone{}
+	err = h.db.Where("cf_id = ?", zone.ID).First(&localZone).Error
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		localZone = models.Zone{
+			CFID:        zone.ID,
+			AccountID:   account.ID,
+			Name:        zone.Name,
+			Status:      zone.Status,
+			NameServers: strings.Join(zone.NameServers, ","),
+			Plan:        zone.Plan.Name,
+		}
+		if createErr := h.db.Create(&localZone).Error; createErr != nil {
+			respondError(w, http.StatusInternalServerError, "保存域名记录失败: "+createErr.Error())
+			return
+		}
+	case err != nil:
+		respondError(w, http.StatusInternalServerError, "查询域名记录失败: "+err.Error())
+		return
+	default:
+		if updateErr := h.db.Model(&localZone).Updates(map[string]interface{}{
+			"account_id":   account.ID,
+			"name":         zone.Name,
+			"status":       zone.Status,
+			"name_servers": strings.Join(zone.NameServers, ","),
+			"plan":         zone.Plan.Name,
+		}).Error; updateErr != nil {
+			respondError(w, http.StatusInternalServerError, "更新域名记录失败: "+updateErr.Error())
+			return
+		}
+	}
+
+	claims := auth.GetUserFromContext(r)
+	if claims != nil {
+		action := "添加"
+		if existed {
+			action = "同步已有"
+		}
+		log.Printf("[Admin] 管理员 %s 在账号 %s 下%s域名 %s", claims.Username, account.Name, action, zone.Name)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"success":      true,
+		"result":       zone,
+		"existed":      existed,
+		"account_id":   account.ID,
+		"account_name": account.Name,
 	})
 }
 
