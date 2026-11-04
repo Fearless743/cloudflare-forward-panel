@@ -27,6 +27,8 @@ function ForwardRules() {
   // 表格分页（受控，创建后回到第一页查看新规则）
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(10)
+  // 搜索关键字（匹配域名 / 主机名 / 目标地址 / 端口 / 创建者）
+  const [keyword, setKeyword] = useState('')
   // 可选域名下拉列表
   const [localZones, setLocalZones] = useState<LocalZone[]>([])
 
@@ -82,7 +84,7 @@ function ForwardRules() {
       await deleteForwardRule(id)
       message.success('删除成功')
       // 删除的是当前页最后一条时，回退到上一页
-      const remaining = rules.length - 1
+      const remaining = filteredRules.length - 1
       const maxPage = Math.max(1, Math.ceil(remaining / pageSize))
       if (page > maxPage) setPage(maxPage)
       fetchData()
@@ -190,6 +192,20 @@ function ForwardRules() {
     zonePortCounts[zoneName] = (zonePortCounts[zoneName] || 0) + 1
   })
 
+  // 按关键字过滤：域名、主机名、目标地址、端口、创建者
+  const normalizedKeyword = keyword.trim().toLowerCase()
+  const filteredRules = normalizedKeyword
+    ? rules.filter((rule) =>
+        [
+          rule.zone_name,
+          rule.hostname,
+          rule.origin_host,
+          String(rule.origin_port),
+          rule.username,
+        ].some((field) => (field || '').toLowerCase().includes(normalizedKeyword))
+      )
+    : rules
+
   const columns = [
     {
       title: '域名',
@@ -256,7 +272,17 @@ function ForwardRules() {
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
         <Title level={4} style={{ margin: 0 }}>全局端口转发</Title>
-        <Space>
+        <Space wrap>
+          <Input.Search
+            allowClear
+            value={keyword}
+            placeholder="搜索域名 / 主机名 / 目标地址 / 端口"
+            style={{ width: 260 }}
+            onChange={(e) => {
+              setKeyword(e.target.value)
+              setPage(1)
+            }}
+          />
           <Button icon={<ReloadOutlined />} onClick={fetchData} loading={loading}>刷新</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>添加规则</Button>
         </Space>
@@ -305,7 +331,7 @@ function ForwardRules() {
 
       <Table
         columns={columns}
-        dataSource={rules}
+        dataSource={filteredRules}
         rowKey="id"
         loading={loading}
         pagination={{
@@ -313,7 +339,10 @@ function ForwardRules() {
           pageSize,
           showSizeChanger: true,
           pageSizeOptions: ['10', '20', '50', '100'],
-          showTotal: (total) => `共 ${total} 条规则`,
+          showTotal: (total) =>
+            normalizedKeyword
+              ? `筛选出 ${total} 条 / 共 ${rules.length} 条规则`
+              : `共 ${total} 条规则`,
           onChange: (p, size) => {
             setPage(p)
             setPageSize(size)
