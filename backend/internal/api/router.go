@@ -1491,8 +1491,9 @@ func (h *Handler) listForwardRules(w http.ResponseWriter, r *http.Request) {
 
 	// 所有用户（包括管理员）都只能查看自己创建的规则，避免跨用户看到他人记录
 	var rules []models.ForwardRule
+	// 新创建的规则排在最上方；id 作为同一时间戳下的兜底排序
 	h.db.Where("user_id = ?", claims.UserID).
-		Order("zone_name, hostname").
+		Order("created_at DESC, id DESC").
 		Find(&rules)
 
 	// 附加创建者用户名
@@ -3453,7 +3454,71 @@ func generateRandomString(length int) string {
 	return string(result)
 }
 
-// generateOriginCertificate 生成 Cloudflare Origin 证书
+// originCertHostnamesKey 生成主机名查找键：去重 + 排序后用逗号拼接，与传入顺序无关。
+func originCertHostnamesKey(hostnames []string) string {
+	seen := make(map[string]struct{}, len(hostnames))
+	keys := make([]string, 0, len(hostnames))
+	for _, h := range hostnames {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h == "" {
+			continue
+		}
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		keys = append(keys, h)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
+}
+
+// normalizeHostnames 去重（保留传入顺序）+ 去空白 + 小写。
+func normalizeHostnames(hostnames []string) []string {
+	seen := make(map[string]struct{}, len(hostnames))
+	result := make([]string, 0, len(hostnames))
+	for _, h := range hostnames {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h == "" {
+			continue
+		}
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		result = append(result, h)
+	}
+	return result
+}
+
+// parseOriginCertExpiry 解析 CF 返回的过期时间；解析失败返回 false。
+func parseOriginCertExpiry(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	formats := []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.000000Z", "2006-01-02 15:04:05"}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// originCertUsable 判断缓存证书是否可复用：过期时间可解析时要求距现在至少还有 30 天。
+func originCertUsable(cert *models.OriginCertificate) bool {
+	expires, ok := parseOriginCertExpiry(cert.ExpiresOn)
+	if !ok {
+		// 无法解析过期时间时，保守复用（Origin 证书有效期 15 年，解析失败概率低）
+		return true
+	}
+	return time.Until(expires) > 30*24*time.Hour
+}
+
+// generateOriginCertificate 生成 Cloudflare Origin 证书。
+// 先查数据库缓存：同一 zone + 相同主机名的证书已存在且未临近过期时直接复用，
+// 否则调用 CF 生成并写入数据库，供下次复用。
 func (h *Handler) generateOriginCertificate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ZoneID    string   `json:"zone_id"`
@@ -3469,21 +3534,87 @@ func (h *Handler) generateOriginCertificate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	hostnames := normalizeHostnames(req.Hostnames)
+	if len(hostnames) == 0 {
+		respondError(w, http.StatusBadRequest, "hostnames are required")
+		return
+	}
+	hostnamesKey := originCertHostnamesKey(hostnames)
+
+	// 查数据库缓存：命中且未临近过期则直接复用
+	var cached models.OriginCertificate
+	cachedFound := h.db.Where("zone_id = ? AND hostnames_key = ?", req.ZoneID, hostnamesKey).First(&cached).Error == nil
+	if cachedFound && originCertUsable(&cached) {
+		var cachedHostnames []string
+		_ = json.Unmarshal([]byte(cached.Hostnames), &cachedHostnames)
+		if len(cachedHostnames) == 0 {
+			cachedHostnames = strings.Split(cached.HostnamesKey, ",")
+		}
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"cached":  true,
+			"result": map[string]interface{}{
+				"id":           cached.CFCertID,
+				"certificate":  cached.Certificate,
+				"private_key":  cached.PrivateKey,
+				"csr":          cached.CSR,
+				"hostnames":    cachedHostnames,
+				"issuer":       cached.Issuer,
+				"expires_on":   cached.ExpiresOn,
+				"request_type": cached.RequestType,
+				"status":       cached.Status,
+			},
+		})
+		return
+	}
+
+	// 未命中或临近过期：调用 CF 生成（15 年有效期）
 	client, err := h.getCFClientForZone(req.ZoneID)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// 生成 15 年有效期的 Origin 证书
-	cert, err := client.GenerateOriginCertificate(req.Hostnames, 5475)
+	cert, err := client.GenerateOriginCertificate(hostnames, 5475)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "生成 Origin 证书失败: "+err.Error())
 		return
 	}
 
+	// 写入/更新数据库缓存，供下次复用
+	hostnamesJSON, _ := json.Marshal(hostnames)
+	var zoneName string
+	var zone models.Zone
+	if err := h.db.Select("name").Where("cf_id = ?", req.ZoneID).First(&zone).Error; err == nil {
+		zoneName = zone.Name
+	}
+	cachedRecord := models.OriginCertificate{
+		ZoneID:       req.ZoneID,
+		ZoneName:     zoneName,
+		Hostnames:    string(hostnamesJSON),
+		HostnamesKey: hostnamesKey,
+		CFCertID:     cert.ID,
+		Certificate:  cert.Certificate,
+		PrivateKey:   cert.PrivateKey,
+		CSR:          cert.CSR,
+		Issuer:       cert.Issuer,
+		ExpiresOn:    cert.ExpiresOn,
+		RequestType:  cert.RequestType,
+		Status:       cert.Status,
+	}
+	if cachedFound {
+		cachedRecord.ID = cached.ID
+		cachedRecord.CreatedAt = cached.CreatedAt
+		if err := h.db.Save(&cachedRecord).Error; err != nil {
+			log.Printf("[OriginCertificate] 更新证书缓存失败 (zone=%s): %v", req.ZoneID, err)
+		}
+	} else if err := h.db.Create(&cachedRecord).Error; err != nil {
+		log.Printf("[OriginCertificate] 保存证书缓存失败 (zone=%s): %v", req.ZoneID, err)
+	}
+
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
+		"cached":  false,
 		"result":  cert,
 	})
 }

@@ -78,6 +78,25 @@ type ForwardRule struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+// OriginCertificate Origin 证书缓存：生成后保存到数据库，下次直接复用，避免重复创建。
+type OriginCertificate struct {
+	ID           uint      `gorm:"primaryKey" json:"id"`
+	ZoneID       string    `gorm:"uniqueIndex:idx_origin_cert_zone_hostnames" json:"zone_id"` // Cloudflare Zone ID
+	ZoneName     string    `json:"zone_name"`                                               // 域名（便于显示）
+	Hostnames    string    `json:"hostnames"`                                               // 主机名（JSON 数组，按传入顺序）
+	HostnamesKey string    `gorm:"uniqueIndex:idx_origin_cert_zone_hostnames" json:"-"`      // 排序+去重后的主机名（查找键）
+	CFCertID     string    `json:"cf_cert_id"`                                              // Cloudflare 证书 ID
+	Certificate  string    `json:"certificate"`                                             // PEM 格式证书
+	PrivateKey   string    `json:"private_key"`                                             // PEM 格式私钥
+	CSR          string    `json:"csr"`                                                     // PEM 格式 CSR
+	Issuer       string    `json:"issuer"`                                                  // 颁发者
+	ExpiresOn    string    `json:"expires_on"`                                              // 过期时间（CF 返回的原始字符串）
+	RequestType  string    `json:"request_type"`                                            // origin-rsa / origin-ecc
+	Status       string    `json:"status"`                                                  // CF 侧状态
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
 // DomainRegistrar 域名注册商配置
 type DomainRegistrar struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`

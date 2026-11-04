@@ -42,7 +42,7 @@ func main() {
 	}
 
 	// 自动迁移
-	if err := db.AutoMigrate(&models.User{}, &models.Setting{}, &models.CFAccount{}, &models.Zone{}, &models.ZoneUser{}, &models.ForwardRule{}, &models.DomainRegistrar{}, &models.RegistrarDomain{}); err != nil {
+	if err := db.AutoMigrate(&models.User{}, &models.Setting{}, &models.CFAccount{}, &models.Zone{}, &models.ZoneUser{}, &models.ForwardRule{}, &models.DomainRegistrar{}, &models.RegistrarDomain{}, &models.OriginCertificate{}); err != nil {
 		log.Fatalf("Failed to migrate database: %v", err)
 	}
 

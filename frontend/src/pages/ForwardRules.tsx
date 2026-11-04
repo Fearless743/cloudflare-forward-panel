@@ -20,9 +20,13 @@ function ForwardRules() {
   const [certModalOpen, setCertModalOpen] = useState(false)
   const [certLoading, setCertLoading] = useState(false)
   const [certificate, setCertificate] = useState<OriginCertificate | null>(null)
+  const [certCached, setCertCached] = useState(false)
   const [selectedRule, setSelectedRule] = useState<ForwardRule | null>(null)
   // 删除中的规则 ID，用于防重复提交
   const [deletingId, setDeletingId] = useState<number | null>(null)
+  // 表格分页（受控，创建后回到第一页查看新规则）
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(10)
   // 可选域名下拉列表
   const [localZones, setLocalZones] = useState<LocalZone[]>([])
 
@@ -77,6 +81,10 @@ function ForwardRules() {
     try {
       await deleteForwardRule(id)
       message.success('删除成功')
+      // 删除的是当前页最后一条时，回退到上一页
+      const remaining = rules.length - 1
+      const maxPage = Math.max(1, Math.ceil(remaining / pageSize))
+      if (page > maxPage) setPage(maxPage)
       fetchData()
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : '删除失败'
@@ -122,6 +130,7 @@ function ForwardRules() {
         message.success('创建成功')
       }
       setModalOpen(false)
+      setPage(1) // 新规则排在最上方，回到第一页
       fetchData()
     } catch (err: unknown) {
       if (err instanceof Error) {
@@ -138,6 +147,7 @@ function ForwardRules() {
     setCertModalOpen(true)
     setCertLoading(true)
     setCertificate(null)
+    setCertCached(false)
 
     try {
       const hostnames = [`*.${zoneName}`]
@@ -146,6 +156,7 @@ function ForwardRules() {
         hostnames: hostnames,
       })
       setCertificate(res.data.result)
+      setCertCached(!!res.data.cached)
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : '生成证书失败'
       message.error(errorMessage)
@@ -297,7 +308,17 @@ function ForwardRules() {
         dataSource={rules}
         rowKey="id"
         loading={loading}
-        pagination={false}
+        pagination={{
+          current: page,
+          pageSize,
+          showSizeChanger: true,
+          pageSizeOptions: ['10', '20', '50', '100'],
+          showTotal: (total) => `共 ${total} 条规则`,
+          onChange: (p, size) => {
+            setPage(p)
+            setPageSize(size)
+          },
+        }}
       />
 
       <Modal
@@ -356,13 +377,15 @@ function ForwardRules() {
       >
         {certLoading ? (
           <div style={{ textAlign: 'center', padding: '40px 0' }}>
-            <div>正在生成证书...</div>
+            <div>正在获取证书...</div>
           </div>
         ) : certificate ? (
           <div>
             <Alert
-              message="证书已生成"
-              description="请将以下证书和私钥配置到源站服务器。证书有效期为 15 年。"
+              message={certCached ? '已复用已保存的证书' : '证书已生成'}
+              description={certCached
+                ? '以下为数据库中已保存的证书和私钥，未重新生成。证书有效期为 15 年。'
+                : '证书和私钥已保存到数据库，下次将直接复用。证书有效期为 15 年。'}
               type="success"
               showIcon
               style={{ marginBottom: 16 }}

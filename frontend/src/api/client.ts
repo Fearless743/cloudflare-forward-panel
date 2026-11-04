@@ -198,10 +198,14 @@ export interface OriginCertificate {
   status: string
 }
 
+export interface OriginCertificateResponse extends CFResponse<OriginCertificate> {
+  cached?: boolean // true 表示直接复用数据库中已保存的证书，未重新生成
+}
+
 export const generateOriginCertificate = (data: {
   zone_id: string
   hostnames: string[]
-}) => api.post<CFResponse<OriginCertificate>>('/origin-certificates', data)
+}) => api.post<OriginCertificateResponse>('/origin-certificates', data)
 
 // Domain Registrars
 export interface DomainRegistrar {
