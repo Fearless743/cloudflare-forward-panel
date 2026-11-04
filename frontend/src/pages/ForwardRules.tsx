@@ -167,13 +167,46 @@ function ForwardRules() {
     }
   }
 
-  // 复制到剪贴板
-  const handleCopy = (text: string, label: string) => {
-    navigator.clipboard.writeText(text).then(() => {
+  // 复制到剪贴板：仅由用户点击触发，不做任何自动复制
+  const copyToClipboard = async (text: string) => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return
+    }
+    // 非安全上下文（HTTP）下的兼容回退
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.setAttribute('readonly', '')
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(textarea)
+    if (!ok) throw new Error('copy failed')
+  }
+
+  const handleCopy = async (text: string, label: string) => {
+    try {
+      await copyToClipboard(text)
       message.success(`${label} 已复制到剪贴板`)
-    }).catch(() => {
+    } catch {
       message.error('复制失败')
-    })
+    }
+  }
+
+  // 主机名格式白名单：仅允许常规 DNS 名称，避免把任意文本写入剪贴板。
+  // ClickFix 类攻击依赖「诱导用户把攻击者控制的内容粘进终端」，
+  // 这里保证复制源是数据字段而非 DOM 文本、且必须经用户显式点击。
+  const hostnamePattern = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i
+
+  const handleCopyHostname = async (hostname: string) => {
+    const value = (hostname || '').trim()
+    if (!hostnamePattern.test(value)) {
+      message.error('主机名格式不合法，已阻止复制')
+      return
+    }
+    await handleCopy(value, `主机名 ${value}`)
   }
 
   // 按域名分组统计
@@ -217,6 +250,19 @@ function ForwardRules() {
       title: '主机名',
       dataIndex: 'hostname',
       key: 'hostname',
+      render: (_: string, record: ForwardRule) => (
+        <Space size={2}>
+          <Text>{record.hostname}</Text>
+          <Button
+            type="text"
+            size="small"
+            icon={<CopyOutlined />}
+            title="复制主机名"
+            aria-label={`复制主机名 ${record.hostname}`}
+            onClick={() => handleCopyHostname(record.hostname)}
+          />
+        </Space>
+      ),
     },
     {
       title: '转发端口',
