@@ -306,6 +306,16 @@ def main():
         req("PUT", "/api/accounts/1", {"auth_type": "token"})
         check("switch back to token auth", state["last_auth"].startswith("Bearer "), state["last_auth"])
 
+        # 凭证前缀自动识别：cfk_ 必须走 Global API Key，cfat_ 走 Bearer
+        req("PUT", "/api/accounts/1", {"api_key": "cfk_e2e_test_key", "auth_type": "token"})
+        check("cfk key forces global auth", state["last_auth_key"] == "cfk_e2e_test_key", state["last_auth_key"])
+        acct = req("GET", "/api/accounts")["result"][0]
+        check("cfk key stored as global_key", acct["auth_type"] == "global_key", acct)
+        req("PUT", "/api/accounts/1", {"api_key": "cfat_e2e_test_token", "auth_type": "global_key"})
+        check("cfat key forces bearer auth", state["last_auth"].startswith("Bearer "), state["last_auth"])
+        acct = req("GET", "/api/accounts")["result"][0]
+        check("cfat key stored as token", acct["auth_type"] == "token", acct)
+
         # 手动添加域名
         zone = req("POST", "/api/zones", {"account_id": 1, "domain": "example.com"})
         zone_id = zone["result"]["id"]

@@ -16,6 +16,16 @@ function Accounts() {
   const isToken = authType !== 'global_key'
   const [deletingId, setDeletingId] = useState<number | null>(null)
 
+  // 根据凭证前缀自动切换认证方式，避免 cfk_ 的 Global API Key 被当成 Token 发送。
+  const handleApiKeyChange = (event: { target: { value: string } }) => {
+    const value = event.target.value
+    if (value.startsWith('cfk_')) {
+      form.setFieldsValue({ auth_type: 'global_key' })
+    } else if (value.startsWith('cfat_') || value.startsWith('cfut_')) {
+      form.setFieldsValue({ auth_type: 'token' })
+    }
+  }
+
   const fetchAccounts = async () => {
     setLoading(true)
     try {
@@ -274,7 +284,7 @@ function Accounts() {
                 rules={[{ required: true, message: '请输入 Account API Token' }]}
                 extra="在 Cloudflare 控制台「Manage account → Account API tokens」创建，使用 cfat_ 前缀的 Token。"
               >
-                <Input.Password placeholder="cfat_xxxxxxxxxxxxxxxx" />
+                <Input.Password placeholder="cfat_xxxxxxxxxxxxxxxx" onChange={handleApiKeyChange} />
               </Form.Item>
               <Form.Item
                 name="account_id"
@@ -299,7 +309,7 @@ function Accounts() {
                 label="Global API Key"
                 rules={[{ required: true, message: '请输入 Global API Key' }]}
               >
-                <Input.Password placeholder="在 CF 控制台 - 我的资料 - API 令牌中查看" />
+                <Input.Password placeholder="cfk_xxxxxxxxxxxxxxxx" onChange={handleApiKeyChange} />
               </Form.Item>
               <Form.Item
                 name="account_id"

@@ -192,6 +192,22 @@ pub struct OriginCertificateResponse {
     pub status: String,
 }
 
+/// 根据凭证前缀推断认证方式：
+/// - `cfk_` = Global API Key → X-Auth-Key + X-Auth-Email
+/// - `cfat_` = Account API Token / `cfut_` = User API Token → Authorization: Bearer
+/// - 旧格式无前缀时沿用数据库中的 auth_type。
+pub fn resolve_auth_type(declared: &str, api_key: &str) -> &'static str {
+    if api_key.starts_with("cfk_") {
+        "global_key"
+    } else if api_key.starts_with("cfat_") || api_key.starts_with("cfut_") {
+        "token"
+    } else if declared.eq_ignore_ascii_case("token") {
+        "token"
+    } else {
+        "global_key"
+    }
+}
+
 /// 单个 Cloudflare 账号的 API 客户端。
 /// 支持 Account API Token（Bearer）与旧版 Global API Key 两种认证方式。
 #[derive(Clone)]
@@ -241,14 +257,11 @@ impl Client {
         self
     }
 
-    /// 设置认证方式，兼容数据库里的空值/历史值（未知值按 Global API Key 处理）。
+    /// 设置认证方式：优先根据凭证前缀自动识别，避免把 cfk_ 的 Global API Key
+    /// 当成 Token 用 Bearer 发送导致 10000 Authentication error。
     pub fn with_auth_type(mut self, auth_type: impl Into<String>) -> Self {
-        let auth_type = auth_type.into();
-        self.auth_type = if auth_type.eq_ignore_ascii_case("token") {
-            "token".to_string()
-        } else {
-            "global_key".to_string()
-        };
+        let declared = auth_type.into();
+        self.auth_type = resolve_auth_type(&declared, &self.api_key).to_string();
         self
     }
 
@@ -678,4 +691,18 @@ fn generate_csr(hostnames: &[String]) -> Result<(String, String), CfError> {
         .map_err(|e| CfError::Other(format!("生成 CSR 失败: {e}")))?;
 
     Ok((csr_pem, key_pem))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_auth_type;
+
+    #[test]
+    fn detects_credential_type_from_prefix() {
+        assert_eq!(resolve_auth_type("token", "cfk_global_key"), "global_key");
+        assert_eq!(resolve_auth_type("global_key", "cfat_account_token"), "token");
+        assert_eq!(resolve_auth_type("global_key", "cfut_user_token"), "token");
+        assert_eq!(resolve_auth_type("token", "legacy-token-value"), "token");
+        assert_eq!(resolve_auth_type("global_key", "legacy-api-key"), "global_key");
+    }
 }

@@ -8,6 +8,7 @@ use serde_json::json;
 use crate::api::extractors::{AdminUser, ApiError, ApiJson, ApiResult};
 use crate::api::settings::mask_secret;
 use crate::api::{ok_json, ok_message, AppState};
+use crate::cfclient::resolve_auth_type;
 use crate::db::now_db;
 use crate::models::CfAccount;
 
@@ -50,10 +51,19 @@ pub async fn create_account(
     AdminUser(_claims): AdminUser,
     ApiJson(req): ApiJson<CreateAccountRequest>,
 ) -> ApiResult<Response> {
-    let auth_type = normalize_auth_type(&req.auth_type)
+    let api_key = req.api_key.trim();
+    let declared_auth_type = normalize_auth_type(&req.auth_type)
         .ok_or_else(|| ApiError::bad_request("auth_type 仅支持 token 或 global_key"))?;
-    if req.api_key.trim().is_empty() {
+    let auth_type = resolve_auth_type(declared_auth_type, api_key);
+
+    if api_key.is_empty() {
         return Err(ApiError::bad_request("api_key is required"));
+    }
+    if auth_type == "global_key" && api_key.starts_with("cfk_") && req.email.trim().is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "检测到 cfk_ 开头的 Global API Key，请切换到 Global API Key 认证并填写邮箱；或改用 cfat_ 开头的 Account API Token",
+        ));
     }
     if auth_type == "global_key" && req.email.trim().is_empty() {
         return Err(ApiError::bad_request("使用 Global API Key 时邮箱必填"));
@@ -146,6 +156,17 @@ pub async fn update_account(
         account.account_id = account_identifier.trim().to_string();
     }
 
+    // 凭证前缀优先：cfk_ 始终按 Global API Key 处理，避免用 Bearer 发送导致 10000。
+    account.auth_type = resolve_auth_type(&account.auth_type, &account.api_key).to_string();
+
+    if account.auth_type == "global_key"
+        && account.api_key.starts_with("cfk_")
+        && account.email.trim().is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "检测到 cfk_ 开头的 Global API Key，请切换到 Global API Key 认证并填写邮箱；或改用 cfat_ 开头的 Account API Token",
+        ));
+    }
     if account.auth_type == "global_key" && account.email.trim().is_empty() {
         return Err(ApiError::bad_request("使用 Global API Key 时邮箱必填"));
     }

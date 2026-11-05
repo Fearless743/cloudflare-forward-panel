@@ -22,6 +22,17 @@ fn ce(err: CfError) -> ApiError {
     ApiError::internal(err.to_string())
 }
 
+/// 给 Cloudflare 认证错误补充可操作提示。
+fn cf_action_error(action: &str, err: CfError) -> ApiError {
+    let text = err.to_string();
+    let hint = if text.contains("[10000]") {
+        "（认证失败：cfk_ 开头的 Global API Key 请使用 Global API Key 认证并填写邮箱；cfat_/cfut_ 开头的 Token 请检查权限和 Zone 资源范围）"
+    } else {
+        ""
+    };
+    ApiError::internal(format!("{action}失败{hint}: {err}"))
+}
+
 // ---------------------------------------------------------------------------
 // 域名可用性 / 权限
 // ---------------------------------------------------------------------------
@@ -2313,7 +2324,7 @@ async fn fetch_zone_check_snapshot(
     let dns_records = client
         .list_dns_records(zone_id, "")
         .await
-        .map_err(|e| ApiError::internal(format!("列出 DNS 记录失败: {e}")))?;
+        .map_err(|e| cf_action_error("列出 DNS 记录", e))?;
 
     let wanted: HashSet<String> = rows
         .iter()
@@ -2325,7 +2336,7 @@ async fn fetch_zone_check_snapshot(
     let list = client
         .list_origin_rulesets(zone_id)
         .await
-        .map_err(|e| ApiError::internal(format!("列出 Cloudflare 规则失败: {e}")))?;
+        .map_err(|e| cf_action_error("列出 Cloudflare 规则", e))?;
     for ruleset in list {
         if ruleset.id.is_empty() || !wanted.contains(&ruleset.id) {
             continue;
@@ -2334,7 +2345,7 @@ async fn fetch_zone_check_snapshot(
             .get_origin_ruleset(zone_id, &ruleset.id)
             .await
             .map_err(|e| {
-                ApiError::internal(format!("获取 Cloudflare 规则 {} 失败: {e}", ruleset.id))
+                cf_action_error(&format!("获取 Cloudflare 规则 {}", ruleset.id), e)
             })?;
         rulesets.insert(full.id.clone(), full);
     }
