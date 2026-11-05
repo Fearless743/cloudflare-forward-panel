@@ -897,24 +897,26 @@ async fn update_rule_dns_record(
     }
 
     let old_id = rule.dns_record_id.clone();
-    let created = client
-        .create_dns_record(
-            &rule.zone_id,
-            &DnsRecord {
-                zone_id: rule.zone_id.clone(),
-                name: rule.hostname.clone(),
-                record_type: new_type.to_string(),
-                content: new_host.to_string(),
-                ttl: 1,
-                proxied: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(ce)?;
+    let created = create_dns_record_adopting_existing(
+        client,
+        &rule.zone_id,
+        &DnsRecord {
+            zone_id: rule.zone_id.clone(),
+            name: rule.hostname.clone(),
+            record_type: new_type.to_string(),
+            content: new_host.to_string(),
+            ttl: 1,
+            proxied: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(ce)?;
 
-    if let Err(err) = client.delete_dns_record(&rule.zone_id, &old_id).await {
-        tracing::warn!(dns_id = %old_id, %err, "[ForwardRule] 删除旧 DNS 记录失败");
+    if created.id != old_id {
+        if let Err(err) = client.delete_dns_record(&rule.zone_id, &old_id).await {
+            tracing::warn!(dns_id = %old_id, %err, "[ForwardRule] 删除旧 DNS 记录失败");
+        }
     }
     Ok(created.id)
 }
@@ -2235,6 +2237,67 @@ fn dns_content_matches(record_type: &str, actual: &str, expected: &str) -> bool 
     actual == expected
 }
 
+async fn create_dns_record_adopting_existing(
+    client: &Client,
+    zone_id: &str,
+    desired: &DnsRecord,
+) -> Result<DnsRecord, CfError> {
+    match client.create_dns_record(zone_id, desired).await {
+        Ok(record) => Ok(record),
+        Err(err) => {
+            let msg = err.to_string();
+            if !msg.contains("81053") {
+                return Err(err);
+            }
+            // 已存在同名冲突记录（常见于手工创建/残留/DB 丢失 dns_record_id）：尝试收敛到面板期望状态。
+            let records = client.list_dns_records(zone_id, "").await?;
+            let mut same_name: Vec<DnsRecord> = records
+                .into_iter()
+                .filter(|r| r.name.eq_ignore_ascii_case(&desired.name))
+                .collect();
+            if same_name.is_empty() {
+                return Err(err);
+            }
+
+            let desired_type = desired.record_type.to_ascii_uppercase();
+            if let Some(pos) = same_name
+                .iter()
+                .position(|r| r.record_type.eq_ignore_ascii_case(&desired_type))
+            {
+                let target = same_name.remove(pos);
+                let updated = client
+                    .update_dns_record(
+                        zone_id,
+                        &target.id,
+                        &DnsRecord {
+                            name: desired.name.clone(),
+                            record_type: desired.record_type.clone(),
+                            content: desired.content.clone(),
+                            ttl: desired.ttl,
+                            proxied: desired.proxied,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                for extra in same_name {
+                    if let Err(del_err) = client.delete_dns_record(zone_id, &extra.id).await {
+                        tracing::warn!(dns_id = %extra.id, %del_err, "[DNS] 删除同名冲突记录失败");
+                    }
+                }
+                return Ok(updated);
+            }
+
+            // 仅剩冲突类型（如 CNAME 与 A/AAAA 互斥）：删除冲突记录后重试创建。
+            for conflict in &same_name {
+                if let Err(del_err) = client.delete_dns_record(zone_id, &conflict.id).await {
+                    tracing::warn!(dns_id = %conflict.id, %del_err, "[DNS] 删除同名冲突记录失败");
+                }
+            }
+            client.create_dns_record(zone_id, desired).await
+        }
+    }
+}
+
 fn push_check_issue(
     issues: &mut Vec<ForwardCheckIssue>,
     row: &ForwardRule,
@@ -2442,21 +2505,21 @@ async fn repair_rule_dns_record(
         });
 
     let Some(record) = current else {
-        let created = client
-            .create_dns_record(
-                &row.zone_id,
-                &DnsRecord {
-                    zone_id: row.zone_id.clone(),
-                    name: row.hostname.clone(),
-                    record_type: expected_type.to_string(),
-                    content: row.origin_host.clone(),
-                    ttl: 1,
-                    proxied: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(ce)?;
+        let created = create_dns_record_adopting_existing(
+            client,
+            &row.zone_id,
+            &DnsRecord {
+                zone_id: row.zone_id.clone(),
+                name: row.hostname.clone(),
+                record_type: expected_type.to_string(),
+                content: row.origin_host.clone(),
+                ttl: 1,
+                proxied: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(ce)?;
         set_rule_dns_record_id(state, row.id, &created.id).await;
         return Ok(());
     };
@@ -2494,23 +2557,26 @@ async fn repair_rule_dns_record(
     }
 
     // 类型变化（A/AAAA/CNAME）无法可靠原地修改：新建后删除旧记录。
-    let created = client
-        .create_dns_record(
-            &row.zone_id,
-            &DnsRecord {
-                zone_id: row.zone_id.clone(),
-                name: row.hostname.clone(),
-                record_type: expected_type.to_string(),
-                content: row.origin_host.clone(),
-                ttl: 1,
-                proxied: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(ce)?;
-    if let Err(err) = client.delete_dns_record(&row.zone_id, &record.id).await {
-        tracing::warn!(dns_id = %record.id, %err, "[ForwardCheck] 删除旧 DNS 记录失败");
+    // 81053 场景下 create_dns_record_adopting_existing 会清理同名冲突并收敛到期望记录。
+    let created = create_dns_record_adopting_existing(
+        client,
+        &row.zone_id,
+        &DnsRecord {
+            zone_id: row.zone_id.clone(),
+            name: row.hostname.clone(),
+            record_type: expected_type.to_string(),
+            content: row.origin_host.clone(),
+            ttl: 1,
+            proxied: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(ce)?;
+    if created.id != record.id {
+        if let Err(err) = client.delete_dns_record(&row.zone_id, &record.id).await {
+            tracing::warn!(dns_id = %record.id, %err, "[ForwardCheck] 删除旧 DNS 记录失败");
+        }
     }
     set_rule_dns_record_id(state, row.id, &created.id).await;
     Ok(())
@@ -3213,6 +3279,24 @@ mod tests {
         assert!(value
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn build_host_expression_escapes_quotes_and_backslashes() {
+        let expr = build_host_expression(&["a\\\"b.example".to_string()]);
+        assert_eq!(expr, "(http.host eq \"a\\\\\\\"b.example\")");
+    }
+
+    #[test]
+    fn origin_host_validation_accepts_expected_values() {
+        assert!(is_valid_origin_host("example.com"));
+        assert!(is_valid_origin_host("sub.example.com"));
+        assert!(is_valid_origin_host("1.2.3.4"));
+        assert!(is_valid_origin_host("2001:db8::1"));
+        assert!(!is_valid_origin_host("example.com/path"));
+        assert!(!is_valid_origin_host("bad host"));
+        assert!(!is_valid_origin_host("bad\"host"));
+        assert!(!is_valid_origin_host(""));
     }
 
     fn sample_rule(hostname: &str, port: i64, origin_host: &str) -> ForwardRule {
