@@ -67,7 +67,7 @@ frontend (Vite/React18/AntD5, TS)  ——HTTP /api——>  backend-rs (Rust/axum
 
 1. **多 CF 账号轮询（`cfclient/manager.rs`）**：`Manager` 持有多个 `Client`（对应 `cf_accounts` 表），`get_client()` 按 `current_index` 轮询。CF API 报错时 `Client` 通过 channel 上报 `Manager::handle_report`：发 Telegram 通知 → 检测封禁错误码（9106/10000）自动 `is_blocked` 并 reload → 否则切换到下一个账号。**注意 10001（资源不存在）不是封禁**。封禁时会回调 `api::forward::migrate_account_rules` 迁移规则。
 
-2. **端口转发（`api/forward.rs`，业务核心）**：创建规则时后端自动完成一组 CF 操作——挑选本地 Zone 表中 CF 规则最少的域名 → 生成随机子域名 → 创建 Origin Rule（`http_request_origin` phase，route action 指定 origin port）→ 按目标地址类型创建 DNS 记录（IPv4→A / IPv6→AAAA / 域名→CNAME，均 proxied）→ 设置 SSL 为 Full。删除时反向清理。另有全量对账（`reconcile_zone_forward_rules`）修复 CF 侧丢失的 ruleset/rule/DNS，并保留面板外手工创建的主机名。后台定时检查任务（`spawn_forward_check_scheduler`）按系统设置中的间隔对比面板与 CF 的 DNS / Origin Rules，可自动修复并通过 Telegram 通知；管理员也可在设置页手动触发检查。
+2. **端口转发（`api/forward.rs`，业务核心）**：创建规则时后端自动完成一组 CF 操作——挑选本地 Zone 表中 CF 规则最少的域名 → 生成随机子域名 → 创建 Origin Rule（`http_request_origin` phase，route action 指定 origin port）→ 按目标地址类型创建 DNS 记录（IPv4→A / IPv6→AAAA / 域名→CNAME，均 proxied）→ 设置 SSL 为 Full。删除时反向清理。另有全量对账（`reconcile_zone_forward_rules`）修复 CF 侧丢失的 ruleset/rule/DNS，并保留面板外手工创建的主机名。后台定时检查任务（`spawn_forward_check_scheduler`）按系统设置中的间隔对比面板与 CF 的 DNS / Origin Rules，可自动修复并通过 Telegram 通知；管理员也可在设置页手动触发检查。检查为单飞任务（`forward_check_lock`），定时与手动不会并发；手动触发接口立即返回，由 `/api/forward-rules/check/status` 轮询进度，避免长请求超时。修复时按 `(ruleset, rule)` 聚合，每个 ruleset 只 GET/PUT 一次。
 
 3. **认证**：JWT（HS256，`Authorization: Bearer <token>`）。**secret 每次启动随机生成**，重启后旧 token 全部失效。角色 `admin`/`user`，通过 `AuthUser` / `AdminUser` axum extractor 区分；每次请求都会从数据库读取实时角色与启用状态，并覆盖 token 快照。默认管理员 `admin / admin123`（首次启动自动创建，`must_change_password=true`，此时仅允许调用改密接口）。
 

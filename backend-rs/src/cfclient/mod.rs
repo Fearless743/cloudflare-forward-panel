@@ -14,14 +14,26 @@ use crate::cfclient::manager::ReportEvent;
 
 pub const BASE_URL: &str = "https://api.cloudflare.com/client/v4";
 
-/// CF API 基址；可通过 `CF_API_BASE_URL` 覆盖（测试/代理场景）。
+/// CF API 基址；仅在测试/开发或显式允许时可通过 `CF_API_BASE_URL` 覆盖，避免生产环境凭证被重定向。
 fn api_base_url() -> &'static str {
     static BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     BASE.get_or_init(|| {
-        std::env::var("CF_API_BASE_URL")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| BASE_URL.to_string())
+        let allow_override = cfg!(test) || cfg!(debug_assertions)
+            || std::env::var("ALLOW_CF_API_BASE_URL_OVERRIDE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        if allow_override {
+            if let Some(value) = std::env::var("CF_API_BASE_URL")
+                .ok()
+                .filter(|value| !value.is_empty())
+            {
+                tracing::warn!(base_url = %value, "[CF API] using overridden base URL");
+                return value;
+            }
+        } else if std::env::var("CF_API_BASE_URL").is_ok() {
+            tracing::warn!("[CF API] CF_API_BASE_URL ignored in production; set ALLOW_CF_API_BASE_URL_OVERRIDE=1 only for trusted test environments");
+        }
+        BASE_URL.to_string()
     })
 }
 
@@ -700,9 +712,15 @@ mod tests {
     #[test]
     fn detects_credential_type_from_prefix() {
         assert_eq!(resolve_auth_type("token", "cfk_global_key"), "global_key");
-        assert_eq!(resolve_auth_type("global_key", "cfat_account_token"), "token");
+        assert_eq!(
+            resolve_auth_type("global_key", "cfat_account_token"),
+            "token"
+        );
         assert_eq!(resolve_auth_type("global_key", "cfut_user_token"), "token");
         assert_eq!(resolve_auth_type("token", "legacy-token-value"), "token");
-        assert_eq!(resolve_auth_type("global_key", "legacy-api-key"), "global_key");
+        assert_eq!(
+            resolve_auth_type("global_key", "legacy-api-key"),
+            "global_key"
+        );
     }
 }

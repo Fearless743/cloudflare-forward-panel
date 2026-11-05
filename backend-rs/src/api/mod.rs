@@ -19,6 +19,7 @@ pub mod auth_handlers;
 pub mod certs;
 pub mod extractors;
 pub mod forward;
+pub mod rate_limit;
 pub mod settings;
 pub mod users;
 pub mod zones;
@@ -27,6 +28,9 @@ pub struct AppState {
     pub db: SqlitePool,
     pub manager: Arc<Manager>,
     pub jwt_secret: Vec<u8>,
+    pub rate_limiter: rate_limit::RateLimiter,
+    /// 保证定时检查与手动检查不会并发执行，避免重复修复产生冲突记录。
+    pub forward_check_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 /// {"success": true, "message": ...}
@@ -40,15 +44,21 @@ pub fn ok_json(value: Value) -> Response {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    let api = Router::new()
-        // ---- 公开路由 ----
+    let auth_routes = Router::new()
         .route("/auth/login", post(auth_handlers::login))
-        // ---- 需要登录 ----
-        .route("/auth/me", get(auth_handlers::get_current_user))
         .route(
             "/auth/change-password",
             post(auth_handlers::change_password),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit::limit_auth,
+        ));
+
+    let api = Router::new()
+        .merge(auth_routes)
+        // ---- 需要登录 ----
+        .route("/auth/me", get(auth_handlers::get_current_user))
         // ---- 端口转发规则 ----
         .route(
             "/forward-rules",
@@ -59,9 +69,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(forward::list_forward_rules).post(forward::create_forward_rule),
         )
         .route("/forward-rules/zones", get(forward::list_local_zones))
+        .route("/forward-rules/check", post(forward::check_forward_rules))
         .route(
-            "/forward-rules/check",
-            post(forward::check_forward_rules),
+            "/forward-rules/check/status",
+            get(forward::forward_check_status),
         )
         .route(
             "/forward-rules/{ruleID}",
@@ -149,27 +160,64 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+fn cors_allowed_origins() -> &'static Vec<String> {
+    static ORIGINS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ORIGINS.get_or_init(|| {
+        std::env::var("CORS_ORIGINS")
+            .ok()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
 async fn cors_middleware(req: axum::extract::Request, next: Next) -> Response {
     let is_options = req.method() == Method::OPTIONS;
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let mut response = if is_options {
-        StatusCode::OK.into_response()
+        StatusCode::NO_CONTENT.into_response()
     } else {
         next.run(req).await
     };
 
-    let headers = response.headers_mut();
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"),
-    );
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("Content-Type, Authorization"),
-    );
+    let allowlist = cors_allowed_origins();
+    if let Some(origin) = origin {
+        let allowed = if allowlist.iter().any(|o| o == "*") {
+            Some("*".to_string())
+        } else if allowlist.iter().any(|o| o == &origin) {
+            Some(origin)
+        } else {
+            None
+        };
+        if let Some(value) = allowed {
+            let headers = response.headers_mut();
+            if let Ok(v) = HeaderValue::from_str(&value) {
+                headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+            }
+            if value != "*" {
+                headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+            }
+            headers.insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+            );
+            headers.insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                HeaderValue::from_static("Content-Type, Authorization"),
+            );
+            headers.insert(
+                header::ACCESS_CONTROL_MAX_AGE,
+                HeaderValue::from_static("600"),
+            );
+        }
+    }
     response
 }
 

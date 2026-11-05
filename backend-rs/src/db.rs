@@ -16,10 +16,20 @@ pub async fn connect(path: &str) -> Result<SqlitePool, sqlx::Error> {
         .busy_timeout(Duration::from_secs(10))
         .foreign_keys(false);
 
-    SqlitePoolOptions::new()
+    let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)
-        .await
+        .await?;
+
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.is_file() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    Ok(pool)
 }
 
 /// 自动迁移：创建缺失的表/索引/列。

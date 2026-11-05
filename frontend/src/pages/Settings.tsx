@@ -18,7 +18,13 @@ import {
   SendOutlined,
   SafetyCertificateOutlined,
 } from '@ant-design/icons'
-import { getSettings, updateSettings, testTelegram, runForwardCheck } from '../api/client'
+import {
+  getSettings,
+  updateSettings,
+  testTelegram,
+  runForwardCheck,
+  getForwardCheckStatus,
+} from '../api/client'
 import type { ForwardCheckIssue, ForwardCheckReport } from '../api/client'
 
 const { Title, Text } = Typography
@@ -27,6 +33,25 @@ function formatCheckedAt(value?: string) {
   if (!value) return '-'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// 检查在后台执行，这里轮询状态直到完成（最多等待 10 分钟）。
+async function waitForForwardCheck(): Promise<ForwardCheckReport | null> {
+  const deadline = Date.now() + 10 * 60 * 1000
+  while (Date.now() < deadline) {
+    await sleep(2000)
+    try {
+      const res = await getForwardCheckStatus()
+      if (!res.data.result.running) {
+        return res.data.result.last_report
+      }
+    } catch {
+      // 网络抖动时继续轮询，避免一次失败就中断等待。
+    }
+  }
+  return null
 }
 
 function Settings() {
@@ -110,8 +135,12 @@ function Settings() {
   const handleRunCheck = async () => {
     setChecking(true)
     try {
-      const res = await runForwardCheck()
-      const report = res.data.result
+      await runForwardCheck()
+      const report = await waitForForwardCheck()
+      if (!report) {
+        message.info('检查仍在后台运行，请稍后刷新页面查看结果')
+        return
+      }
       setCheckReport(report)
       if (report.issues.length === 0) {
         message.success(
@@ -209,10 +238,12 @@ function Settings() {
                   onClick={handleRunCheck}
                   loading={checking}
                 >
-                  立即检查
+                  {checking ? '检查中…' : '立即检查'}
                 </Button>
                 <Text type="secondary">
-                  上次检查：{formatCheckedAt(checkReport?.checked_at)}
+                  {checking
+                    ? '检查在后台运行，可能需要几分钟…'
+                    : `上次检查：${formatCheckedAt(checkReport?.checked_at)}`}
                 </Text>
               </Space>
             </Form.Item>

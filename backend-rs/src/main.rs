@@ -57,6 +57,8 @@ async fn main() {
         db: pool.clone(),
         manager: manager.clone(),
         jwt_secret: auth::generate_secret(),
+        rate_limiter: api::rate_limit::RateLimiter::new(),
+        forward_check_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     });
 
     // 账号被封禁时，自动迁移其名下转发规则到其他账号（弱引用避免循环）。
@@ -92,7 +94,12 @@ async fn main() {
         }
     };
 
-    if let Err(err) = axum::serve(listener, app).await {
+    if let Err(err) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    {
         tracing::error!(%err, "Server failed");
         std::process::exit(1);
     }

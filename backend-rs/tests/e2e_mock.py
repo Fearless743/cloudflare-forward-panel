@@ -263,6 +263,17 @@ def check(name, condition, detail=""):
         print(f"FAIL  {name} {detail}")
 
 
+def run_check():
+    """触发后台检查并轮询到完成，返回最近一次报告。"""
+    req("POST", "/api/forward-rules/check")
+    for _ in range(200):
+        status = req("GET", "/api/forward-rules/check/status")["result"]
+        if not status["running"]:
+            return status["last_report"]
+        time.sleep(0.05)
+    raise AssertionError("forward check did not finish in time")
+
+
 def wait_port(port):
     for _ in range(100):
         with socket.socket() as s:
@@ -348,7 +359,7 @@ def main():
         check("expression merged", rule1["hostname"] in rs["rules"][0]["expression"] and rule2["hostname"] in rs["rules"][0]["expression"])
 
         # 定时检查：面板与 CF 一致时无问题
-        report = req("POST", "/api/forward-rules/check")["result"]
+        report = run_check()
         check("check clean state", report["issues"] == [], report)
         check("check counted rules", report["checked_rules"] == 2, report)
 
@@ -356,7 +367,7 @@ def main():
         state["dns"][rule1["dns_record_id"]]["content"] = "5.5.5.5"
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
         rs["rules"][0]["action_parameters"]["origin"]["port"] = 1234
-        report = req("POST", "/api/forward-rules/check")["result"]
+        report = run_check()
         check("check auto fixed drift", report["fixed"] >= 2, report)
         check("check leaves no remaining issues", report["issues"] == [], report)
         check("check fixed dns", state["dns"][rule1["dns_record_id"]]["content"] == "1.2.3.4")
@@ -366,7 +377,7 @@ def main():
         # 表达式丢失主机名：应按面板重建
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
         rs["rules"][0]["expression"] = f'(http.host eq "{rule2["hostname"]}")'
-        report = req("POST", "/api/forward-rules/check")["result"]
+        report = run_check()
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
         check("check fixed missing hostname", rule1["hostname"] in rs["rules"][0]["expression"], report)
         check("check kept sibling hostname", rule2["hostname"] in rs["rules"][0]["expression"], report)
@@ -376,22 +387,33 @@ def main():
         rs["rules"][0]["expression"] = (
             f'((http.host eq "{rule1["hostname"]}") or (http.host eq "intruder.example.com"))'
         )
-        report = req("POST", "/api/forward-rules/check")["result"]
+        report = run_check()
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
         check("check removed external hostname", "intruder.example.com" not in rs["rules"][0]["expression"], report)
         check("check restored panel hostnames", rule1["hostname"] in rs["rules"][0]["expression"] and rule2["hostname"] in rs["rules"][0]["expression"], report)
 
+        # 仅多出面板外主机名、面板主机名都在：也应检测并移除
+        rs = state["rulesets"][rule1["cf_ruleset_id"]]
+        rs["rules"][0]["expression"] = (
+            f'((http.host eq "{rule1["hostname"]}") or (http.host eq "{rule2["hostname"]}") '
+            f'or (http.host eq "intruder2.example.com"))'
+        )
+        report = run_check()
+        rs = state["rulesets"][rule1["cf_ruleset_id"]]
+        check("check removed extra-only hostname", "intruder2.example.com" not in rs["rules"][0]["expression"], report)
+        check("check kept all panel hostnames", rule1["hostname"] in rs["rules"][0]["expression"] and rule2["hostname"] in rs["rules"][0]["expression"], report)
+
         # 规则被停用：应重新启用
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
         rs["rules"][0]["enabled"] = False
-        req("POST", "/api/forward-rules/check")
+        run_check()
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
         check("check re-enabled origin rule", rs["rules"][0]["enabled"] is True)
 
         # DNS 名称/代理状态被改坏：应恢复
         state["dns"][rule1["dns_record_id"]]["name"] = "wrong.example.com"
         state["dns"][rule1["dns_record_id"]]["proxied"] = False
-        req("POST", "/api/forward-rules/check")
+        run_check()
         dns = state["dns"][rule1["dns_record_id"]]
         check("check fixed dns name", dns["name"] == rule1["hostname"], dns)
         check("check fixed dns proxied", dns["proxied"] is True, dns)
@@ -399,7 +421,7 @@ def main():
         # DNS 类型被改坏：应重建为面板需要的 A 记录
         state["dns"][rule1["dns_record_id"]]["type"] = "CNAME"
         state["dns"][rule1["dns_record_id"]]["content"] = "wrong.example.com"
-        req("POST", "/api/forward-rules/check")
+        run_check()
         check("check removed wrong-type dns", rule1["dns_record_id"] not in state["dns"], state["dns"])
         rebuilt_dns = [r for r in state["dns"].values() if r["name"] == rule1["hostname"]]
         check("check rebuilt dns type", len(rebuilt_dns) == 1 and rebuilt_dns[0]["type"] == "A", rebuilt_dns)

@@ -163,9 +163,17 @@ export const testConnection = () =>
   api.post<CFResponse<{ status: string; zones_count: number }>>('/settings/test')
 export const testTelegram = () =>
   api.post<CFResponse<{ message: string }>>('/settings/test-telegram')
-// 手动触发一次 DNS / Origin Rules 检查
+export interface ForwardCheckStatus {
+  running: boolean
+  last_report: ForwardCheckReport | null
+  last_run: string | null
+}
+// 手动触发一次 DNS / Origin Rules 检查（后台执行，立即返回）
 export const runForwardCheck = () =>
-  api.post<CFResponse<ForwardCheckReport>>('/forward-rules/check')
+  api.post<CFResponse<{ started: boolean; running: boolean }>>('/forward-rules/check')
+// 查询检查进度与最近一次结果
+export const getForwardCheckStatus = () =>
+  api.get<CFResponse<ForwardCheckStatus>>('/forward-rules/check/status')
 
 // Accounts
 export interface CFAccount {

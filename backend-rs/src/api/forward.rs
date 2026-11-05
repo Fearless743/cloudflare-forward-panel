@@ -291,15 +291,20 @@ fn is_valid_hostname(host: &str) -> bool {
             && label.len() <= 63
             && !label.starts_with('-')
             && !label.ends_with('-')
-            && label
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     })
 }
 
 fn is_valid_origin_host(host: &str) -> bool {
     let host = host.trim();
-    if host.is_empty() || host.len() > 253 || host.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\'' | '\\' | '/' | '?' | '#' | '@')) {
+    if host.is_empty()
+        || host.len() > 253
+        || host.chars().any(|c| {
+            c.is_control()
+                || c.is_whitespace()
+                || matches!(c, '"' | '\'' | '\\' | '/' | '?' | '#' | '@')
+        })
+    {
         return false;
     }
     host.parse::<std::net::IpAddr>().is_ok() || is_valid_hostname(host)
@@ -571,15 +576,6 @@ async fn sync_rule_expression(
     rule: &ForwardRule,
 ) -> FResult<()> {
     sync_rule_expression_inner(state, client, rule, true).await
-}
-
-/// 严格按面板数据重建表达式（不保留面板外手工主机名），用于定时检查自动修复。
-async fn sync_rule_expression_strict(
-    state: &AppState,
-    client: &Client,
-    rule: &ForwardRule,
-) -> FResult<()> {
-    sync_rule_expression_inner(state, client, rule, false).await
 }
 
 async fn sync_rule_expression_inner(
@@ -915,7 +911,7 @@ async fn update_rule_dns_record(
 
     if created.id != old_id {
         if let Err(err) = client.delete_dns_record(&rule.zone_id, &old_id).await {
-            tracing::warn!(dns_id = %old_id, %err, "[ForwardRule] 删除旧 DNS 记录失败");
+            log_dns_cleanup_delete("[ForwardRule] 删除旧 DNS 记录失败", &old_id, &err);
         }
     }
     Ok(created.id)
@@ -1321,7 +1317,9 @@ pub async fn update_forward_rule(
     }
     let origin_host = req.origin_host.trim();
     if origin_host.is_empty() || !is_valid_origin_host(origin_host) {
-        return Err(ApiError::bad_request("origin_host 格式无效，请填写合法 IP 或域名"));
+        return Err(ApiError::bad_request(
+            "origin_host 格式无效，请填写合法 IP 或域名",
+        ));
     }
     req.origin_host = origin_host.to_string();
 
@@ -1635,7 +1633,7 @@ async fn merge_rule_into_existing_port(
             .delete_dns_record(&old_snapshot.zone_id, &old_snapshot.dns_record_id)
             .await
         {
-            if !is_10001(&err) {
+            if !is_10001(&err) && !is_benign_dns_delete_error(&err) {
                 tracing::warn!(
                     dns_id = %old_snapshot.dns_record_id,
                     %err,
@@ -1913,8 +1911,17 @@ async fn reconcile_zone_forward_rules(
         .await
         .map_err(|e| cf_action_error("列出 Cloudflare 规则", e))?;
 
+    // 只获取本地规则引用到的 ruleset，避免对无关 ruleset 做无谓的 GET。
+    let wanted: HashSet<&str> = rows
+        .iter()
+        .map(|row| row.cf_rule_set_id.as_str())
+        .filter(|id| !id.is_empty())
+        .collect();
     let mut ruleset_map: HashMap<String, OriginRuleset> = HashMap::new();
     for ruleset in &existing_list {
+        if ruleset.id.is_empty() || !wanted.contains(ruleset.id.as_str()) {
+            continue;
+        }
         if let Ok(full) = client.get_origin_ruleset(zone_id, &ruleset.id).await {
             ruleset_map.insert(full.id.clone(), full);
         }
@@ -2237,6 +2244,22 @@ fn dns_content_matches(record_type: &str, actual: &str, expected: &str) -> bool 
     actual == expected
 }
 
+fn is_benign_dns_delete_error(err: &CfError) -> bool {
+    let msg = err.to_string();
+    msg.contains("[81044]")
+        || msg.contains("[1001]")
+        || msg.to_ascii_lowercase().contains("record does not exist")
+        || msg.to_ascii_lowercase().contains("does not exist")
+}
+
+fn log_dns_cleanup_delete(context: &str, dns_id: &str, err: &CfError) {
+    if is_benign_dns_delete_error(err) {
+        tracing::debug!(dns_id, %err, "{context}: DNS 记录已不存在，跳过删除");
+    } else {
+        tracing::warn!(dns_id, %err, "{context}");
+    }
+}
+
 async fn create_dns_record_adopting_existing(
     client: &Client,
     zone_id: &str,
@@ -2281,7 +2304,7 @@ async fn create_dns_record_adopting_existing(
                     .await?;
                 for extra in same_name {
                     if let Err(del_err) = client.delete_dns_record(zone_id, &extra.id).await {
-                        tracing::warn!(dns_id = %extra.id, %del_err, "[DNS] 删除同名冲突记录失败");
+                        log_dns_cleanup_delete("[DNS] 删除同名冲突记录失败", &extra.id, &del_err);
                     }
                 }
                 return Ok(updated);
@@ -2290,7 +2313,7 @@ async fn create_dns_record_adopting_existing(
             // 仅剩冲突类型（如 CNAME 与 A/AAAA 互斥）：删除冲突记录后重试创建。
             for conflict in &same_name {
                 if let Err(del_err) = client.delete_dns_record(zone_id, &conflict.id).await {
-                    tracing::warn!(dns_id = %conflict.id, %del_err, "[DNS] 删除同名冲突记录失败");
+                    log_dns_cleanup_delete("[DNS] 删除同名冲突记录失败", &conflict.id, &del_err);
                 }
             }
             client.create_dns_record(zone_id, desired).await
@@ -2373,8 +2396,12 @@ fn inspect_zone_forward_rules(
         } else {
             push_check_issue(&mut issues, row, "DNS", "DNS 记录不存在");
         }
+    }
 
-        // ---- Origin Rules ----
+    // ---- Origin Rules ----
+    // 同一条 CF rule 可能被多条面板规则共享，按 (ruleset, rule) 聚合后只报告一次。
+    let mut groups: BTreeMap<(&str, &str), Vec<&ForwardRule>> = BTreeMap::new();
+    for row in rows {
         if row.cf_rule_set_id.is_empty() || row.cf_rule_id.is_empty() {
             push_check_issue(
                 &mut issues,
@@ -2384,51 +2411,81 @@ fn inspect_zone_forward_rules(
             );
             continue;
         }
+        groups
+            .entry((row.cf_rule_set_id.as_str(), row.cf_rule_id.as_str()))
+            .or_default()
+            .push(row);
+    }
 
-        let Some(ruleset) = rulesets.get(&row.cf_rule_set_id) else {
-            push_check_issue(&mut issues, row, "Origin Rules", "Origin Ruleset 不存在");
+    for ((set_id, rule_id), group_rows) in groups {
+        let Some(anchor) = group_rows.first() else {
             continue;
         };
-        let Some(rule) = ruleset
-            .rules
-            .iter()
-            .find(|rule| rule.id == row.cf_rule_id)
-        else {
-            push_check_issue(&mut issues, row, "Origin Rules", "Origin Rule 不存在");
+        let Some(ruleset) = rulesets.get(set_id) else {
+            push_check_issue(&mut issues, anchor, "Origin Rules", "Origin Ruleset 不存在");
+            continue;
+        };
+        let Some(rule) = ruleset.rules.iter().find(|rule| rule.id == rule_id) else {
+            push_check_issue(&mut issues, anchor, "Origin Rules", "Origin Rule 不存在");
             continue;
         };
 
-        let hosts = parse_hostname_list(&rule.expression);
-        let contains_host = hosts
-            .iter()
-            .any(|host| host.eq_ignore_ascii_case(&row.hostname));
+        let mut diffs = Vec::new();
+        let actual_port = origin_rule_port(rule);
+        if actual_port != anchor.origin_port {
+            diffs.push(format!("端口 {} -> {}", anchor.origin_port, actual_port));
+        }
 
-        if row.enabled {
-            let mut diffs = Vec::new();
-            let actual_port = origin_rule_port(rule);
-            if actual_port != row.origin_port {
-                diffs.push(format!("端口 {} -> {}", row.origin_port, actual_port));
+        let expected_hosts: Vec<&str> = group_rows
+            .iter()
+            .filter(|row| row.enabled)
+            .map(|row| row.hostname.as_str())
+            .collect();
+        let expected_set: HashSet<String> = expected_hosts
+            .iter()
+            .map(|host| host.to_ascii_lowercase())
+            .collect();
+        let actual_hosts = parse_hostname_list(&rule.expression);
+        let actual_set: HashSet<String> = actual_hosts
+            .iter()
+            .map(|host| host.to_ascii_lowercase())
+            .collect();
+
+        let missing: Vec<&str> = expected_hosts
+            .iter()
+            .copied()
+            .filter(|host| !actual_set.contains(&host.to_ascii_lowercase()))
+            .collect();
+        if !missing.is_empty() {
+            diffs.push(format!("缺少主机名 {}", missing.join(", ")));
+        }
+
+        // 规则已停用且面板无启用主机名时，表达式内容不会生效，无需反复报告。
+        if rule.enabled || !expected_hosts.is_empty() {
+            let extra: Vec<&str> = actual_hosts
+                .iter()
+                .map(String::as_str)
+                .filter(|host| !expected_set.contains(&host.to_ascii_lowercase()))
+                .collect();
+            if !extra.is_empty() {
+                diffs.push(format!("包含面板外主机名 {}", extra.join(", ")));
             }
-            if !contains_host {
-                diffs.push("表达式未包含该主机名".to_string());
+        }
+
+        if expected_hosts.is_empty() {
+            if rule.enabled {
+                diffs.push("所有主机名已禁用，但规则仍启用".to_string());
             }
-            if !rule.enabled {
-                diffs.push("规则已被停用".to_string());
-            }
-            if !diffs.is_empty() {
-                push_check_issue(
-                    &mut issues,
-                    row,
-                    "Origin Rules",
-                    format!("Origin Rule 不一致: {}", diffs.join("，")),
-                );
-            }
-        } else if contains_host {
+        } else if !rule.enabled {
+            diffs.push("规则已被停用".to_string());
+        }
+
+        if !diffs.is_empty() {
             push_check_issue(
                 &mut issues,
-                row,
+                anchor,
                 "Origin Rules",
-                "已禁用，但主机名仍存在于 Origin Rule 表达式",
+                format!("Origin Rule 不一致: {}", diffs.join("，")),
             );
         }
     }
@@ -2453,6 +2510,10 @@ async fn fetch_zone_check_snapshot(
         .collect();
 
     let mut rulesets = HashMap::new();
+    if wanted.is_empty() {
+        return Ok((dns_records, rulesets));
+    }
+
     let list = client
         .list_origin_rulesets(zone_id)
         .await
@@ -2464,9 +2525,7 @@ async fn fetch_zone_check_snapshot(
         let full = client
             .get_origin_ruleset(zone_id, &ruleset.id)
             .await
-            .map_err(|e| {
-                cf_action_error(&format!("获取 Cloudflare 规则 {}", ruleset.id), e)
-            })?;
+            .map_err(|e| cf_action_error(&format!("获取 Cloudflare 规则 {}", ruleset.id), e))?;
         rulesets.insert(full.id.clone(), full);
     }
 
@@ -2474,26 +2533,26 @@ async fn fetch_zone_check_snapshot(
 }
 
 async fn set_rule_dns_record_id(state: &AppState, rule_id: i64, dns_record_id: &str) {
-    if let Err(err) = sqlx::query(
-        "UPDATE forward_rules SET dns_record_id = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(dns_record_id)
-    .bind(now_db())
-    .bind(rule_id)
-    .execute(&state.db)
-    .await
+    if let Err(err) =
+        sqlx::query("UPDATE forward_rules SET dns_record_id = ?, updated_at = ? WHERE id = ?")
+            .bind(dns_record_id)
+            .bind(now_db())
+            .bind(rule_id)
+            .execute(&state.db)
+            .await
     {
         tracing::warn!(rule_id, %err, "[ForwardCheck] 更新 DNS 记录 ID 失败");
     }
 }
 
 /// 修复单条规则对应的 DNS 记录（内容、类型、代理状态、记录 ID）。
+/// 返回修复后的记录，供同一批次后续规则复用，避免使用过期快照重复创建。
 async fn repair_rule_dns_record(
     state: &AppState,
     client: &Client,
     row: &ForwardRule,
     dns_records: &[DnsRecord],
-) -> FResult<()> {
+) -> FResult<DnsRecord> {
     let expected_type = detect_dns_record_type(&row.origin_host);
     let current = dns_records
         .iter()
@@ -2521,7 +2580,7 @@ async fn repair_rule_dns_record(
         .await
         .map_err(ce)?;
         set_rule_dns_record_id(state, row.id, &created.id).await;
-        return Ok(());
+        return Ok(created);
     };
 
     let record_matches = record.name.eq_ignore_ascii_case(&row.hostname)
@@ -2533,7 +2592,7 @@ async fn repair_rule_dns_record(
         if record.id != row.dns_record_id {
             set_rule_dns_record_id(state, row.id, &record.id).await;
         }
-        return Ok(());
+        return Ok(record.clone());
     }
 
     if record.record_type.eq_ignore_ascii_case(expected_type) {
@@ -2553,7 +2612,7 @@ async fn repair_rule_dns_record(
             .await
             .map_err(ce)?;
         set_rule_dns_record_id(state, row.id, &updated.id).await;
-        return Ok(());
+        return Ok(updated);
     }
 
     // 类型变化（A/AAAA/CNAME）无法可靠原地修改：新建后删除旧记录。
@@ -2575,11 +2634,111 @@ async fn repair_rule_dns_record(
     .map_err(ce)?;
     if created.id != record.id {
         if let Err(err) = client.delete_dns_record(&row.zone_id, &record.id).await {
-            tracing::warn!(dns_id = %record.id, %err, "[ForwardCheck] 删除旧 DNS 记录失败");
+            log_dns_cleanup_delete("[ForwardCheck] 删除旧 DNS 记录失败", &record.id, &err);
         }
     }
     set_rule_dns_record_id(state, row.id, &created.id).await;
-    Ok(())
+    Ok(created)
+}
+
+fn upsert_dns_record(records: &mut Vec<DnsRecord>, record: DnsRecord) {
+    if record.id.is_empty() {
+        return;
+    }
+    if let Some(existing) = records.iter_mut().find(|item| item.id == record.id) {
+        *existing = record;
+    } else {
+        records.push(record);
+    }
+}
+
+/// 判断问题是否需要全量对账（只有 ruleset/rule 丢失时才需要重建资源）。
+fn issue_needs_reconcile(issue: &ForwardCheckIssue) -> bool {
+    issue.target == "Origin Rules"
+        && (issue.message.contains("Origin Ruleset 不存在")
+            || issue.message.contains("Origin Rule 不存在"))
+}
+
+/// 以面板数据为准批量修复某个域名下的 Origin Rules。
+/// 同一 ruleset 只 GET/PUT 一次，避免同端口多条规则时重复请求。
+async fn repair_zone_origin_rules(
+    client: &Client,
+    zone_id: &str,
+    rows: &[ForwardRule],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut by_ruleset: BTreeMap<String, HashMap<String, Vec<ForwardRule>>> = BTreeMap::new();
+    for row in rows {
+        if row.cf_rule_set_id.is_empty() || row.cf_rule_id.is_empty() {
+            continue;
+        }
+        by_ruleset
+            .entry(row.cf_rule_set_id.clone())
+            .or_default()
+            .entry(row.cf_rule_id.clone())
+            .or_default()
+            .push(row.clone());
+    }
+
+    for (ruleset_id, groups) in by_ruleset {
+        let mut full = match client.get_origin_ruleset(zone_id, &ruleset_id).await {
+            Ok(full) => full,
+            Err(err) => {
+                errors.push(format!("获取 Cloudflare 规则 {ruleset_id} 失败: {err}"));
+                continue;
+            }
+        };
+
+        let mut changed = false;
+        for (rule_id, group_rows) in groups {
+            let Some(idx) = full.rules.iter().position(|rule| rule.id == rule_id) else {
+                errors.push(format!("Cloudflare 规则 {rule_id} 不存在"));
+                continue;
+            };
+
+            let port = group_rows.first().map(|row| row.origin_port).unwrap_or(0);
+            let hosts = enabled_hosts(&group_rows);
+            let rule = &mut full.rules[idx];
+
+            if origin_rule_port(rule) != port {
+                if rule.action_parameters.is_none() {
+                    rule.action_parameters = Some(ActionParams::default());
+                }
+                let params = rule.action_parameters.as_mut().unwrap();
+                if params.origin.is_none() {
+                    params.origin = Some(OriginParams::default());
+                }
+                params.origin.as_mut().unwrap().port = port;
+                rule.description = format!("Forward to port {port}");
+                changed = true;
+            }
+
+            if hosts.is_empty() {
+                if rule.enabled {
+                    rule.enabled = false;
+                    changed = true;
+                }
+            } else {
+                let expression = build_host_expression(&hosts);
+                if !rule.enabled || rule.expression != expression {
+                    rule.enabled = true;
+                    rule.expression = expression;
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            if let Err(err) = client
+                .update_origin_ruleset(zone_id, &ruleset_id, &full)
+                .await
+            {
+                errors.push(format!("更新 Cloudflare 规则 {ruleset_id} 失败: {err}"));
+            }
+        }
+    }
+
+    errors
 }
 
 /// 尽力修复某个域名下所有不一致，返回无法修复的错误信息。
@@ -2587,12 +2746,15 @@ async fn repair_zone_forward_rules(
     state: &AppState,
     client: &Client,
     zone_id: &str,
+    needs_reconcile: bool,
 ) -> Vec<String> {
     let mut errors = Vec::new();
 
-    // 先补回丢失的 ruleset / rule / DNS 记录。
-    if let Err(err) = reconcile_zone_forward_rules(state, client, zone_id).await {
-        errors.push(format!("重建丢失的 Cloudflare 资源失败: {}", err.message));
+    // 仅在 ruleset / rule 丢失时做全量对账，避免普通漂移也拉取全部资源。
+    if needs_reconcile {
+        if let Err(err) = reconcile_zone_forward_rules(state, client, zone_id).await {
+            errors.push(format!("重建丢失的 Cloudflare 资源失败: {}", err.message));
+        }
     }
 
     let rows = match sqlx::query_as::<_, ForwardRule>(
@@ -2609,58 +2771,23 @@ async fn repair_zone_forward_rules(
         }
     };
 
-    // DNS 修复
-    let dns_records = match client.list_dns_records(zone_id, "").await {
-        Ok(records) => records,
-        Err(err) => {
-            errors.push(cf_action_error_message("列出 DNS 记录", &err));
-            Vec::new()
-        }
-    };
-    for row in &rows {
-        if let Err(err) = repair_rule_dns_record(state, client, row, &dns_records).await {
-            errors.push(format!("修复 {} 的 DNS 记录失败: {}", row.hostname, err.message));
-        }
-    }
-
-    // Origin Rules 修复：同一 (ruleset, rule) 只处理一次。
-    let mut seen = HashSet::new();
-    for row in &rows {
-        if row.cf_rule_set_id.is_empty() || row.cf_rule_id.is_empty() {
-            continue;
-        }
-        if !seen.insert((row.cf_rule_set_id.clone(), row.cf_rule_id.clone())) {
-            continue;
-        }
-
-        let full = match client
-            .get_origin_ruleset(&row.zone_id, &row.cf_rule_set_id)
-            .await
-        {
-            Ok(full) => full,
-            Err(err) => {
-                errors.push(format!("获取 Cloudflare 规则 {} 失败: {err}", row.cf_rule_set_id));
-                continue;
-            }
-        };
-
-        let Some(rule) = full.rules.iter().find(|rule| rule.id == row.cf_rule_id) else {
-            errors.push(format!("Cloudflare 规则 {} 不存在", row.cf_rule_id));
-            continue;
-        };
-
-        // 先修正端口，再按面板数据重建表达式（会保留面板外手工主机名）。
-        if origin_rule_port(rule) != row.origin_port {
-            if let Err(err) = update_rule_port(client, row, row.origin_port).await {
-                errors.push(format!("修复 {} 的端口失败: {}", row.hostname, err.message));
-                continue;
+    // DNS 修复：每修复一条就更新内存快照，避免同主机名规则使用过期数据重复创建。
+    match client.list_dns_records(zone_id, "").await {
+        Ok(mut dns_records) => {
+            for row in &rows {
+                match repair_rule_dns_record(state, client, row, &dns_records).await {
+                    Ok(repaired) => upsert_dns_record(&mut dns_records, repaired),
+                    Err(err) => errors.push(format!(
+                        "修复 {} 的 DNS 记录失败: {}",
+                        row.hostname, err.message
+                    )),
+                }
             }
         }
-        if let Err(err) = sync_rule_expression_strict(state, client, row).await {
-            errors.push(format!("修复 {} 的 Origin Rule 失败: {}", row.hostname, err.message));
-        }
+        Err(err) => errors.push(cf_action_error_message("列出 DNS 记录", &err)),
     }
 
+    errors.extend(repair_zone_origin_rules(client, zone_id, &rows).await);
     errors
 }
 
@@ -2740,8 +2867,21 @@ async fn notify_forward_check(state: &Arc<AppState>, report: &ForwardCheckReport
         let _ = settings::save_setting(state, "forward_check_last_notified", &signature).await;
     }
 }
-/// 执行一次全量检查（定时任务与手动检查共用）。
-pub async fn run_forward_health_check(state: &Arc<AppState>) -> ForwardCheckReport {
+/// 在后台启动一次检查；已有检查在运行则返回 false。
+/// 锁在触发时即被占用，确保前端随后查询状态时不会误判为“尚未开始”。
+fn spawn_forward_health_check(state: &Arc<AppState>) -> bool {
+    let Ok(guard) = state.forward_check_lock.clone().try_lock_owned() else {
+        return false;
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        run_forward_health_check_inner(&state).await;
+    });
+    true
+}
+
+async fn run_forward_health_check_inner(state: &Arc<AppState>) -> ForwardCheckReport {
     let config = forward_check_config(state).await;
     let mut report = ForwardCheckReport {
         checked_at: chrono::Local::now().to_rfc3339(),
@@ -2771,7 +2911,9 @@ pub async fn run_forward_health_check(state: &Arc<AppState>) -> ForwardCheckRepo
         {
             Ok(rows) => rows,
             Err(err) => {
-                report.errors.push(format!("{zone_id}: 读取本地规则失败: {err}"));
+                report
+                    .errors
+                    .push(format!("{zone_id}: 读取本地规则失败: {err}"));
                 continue;
             }
         };
@@ -2802,7 +2944,8 @@ pub async fn run_forward_health_check(state: &Arc<AppState>) -> ForwardCheckRepo
         let mut issues = inspect_zone_forward_rules(&rows, &dns_records, &rulesets);
 
         if config.auto_fix && !issues.is_empty() {
-            let errors = repair_zone_forward_rules(state, &client, &zone_id).await;
+            let needs_reconcile = issues.iter().any(issue_needs_reconcile);
+            let errors = repair_zone_forward_rules(state, &client, &zone_id, needs_reconcile).await;
             report.errors.extend(errors);
 
             // 修复后重新检查，只把仍然不一致的问题上报。
@@ -2853,13 +2996,38 @@ pub async fn run_forward_health_check(state: &Arc<AppState>) -> ForwardCheckRepo
     report
 }
 
-/// 手动触发一次检查（管理员）。
+/// 手动触发一次检查（管理员）。立即返回，由前端轮询进度，避免长请求超时。
 pub async fn check_forward_rules(
     State(state): State<Arc<AppState>>,
     AdminUser(_claims): AdminUser,
 ) -> ApiResult<Response> {
-    let report = run_forward_health_check(&state).await;
-    Ok(ok_json(json!({ "success": true, "result": report })))
+    let started = spawn_forward_health_check(&state);
+    Ok(ok_json(json!({
+        "success": true,
+        "result": { "started": started, "running": true }
+    })))
+}
+
+/// 查询检查运行状态与最近一次结果（管理员）。
+pub async fn forward_check_status(
+    State(state): State<Arc<AppState>>,
+    AdminUser(_claims): AdminUser,
+) -> ApiResult<Response> {
+    let running = state.forward_check_lock.try_lock().is_err();
+    let last_report = settings::setting_value(&state, "forward_check_last_report")
+        .await
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .unwrap_or(Value::Null);
+    let last_run = settings::setting_value(&state, "forward_check_last_run").await;
+
+    Ok(ok_json(json!({
+        "success": true,
+        "result": {
+            "running": running,
+            "last_report": last_report,
+            "last_run": last_run,
+        }
+    })))
 }
 
 /// 启动后台定时检查任务。每 60 秒唤醒一次，按配置的间隔执行。
@@ -2883,17 +3051,23 @@ pub fn spawn_forward_check_scheduler(state: Arc<AppState>) {
                 .and_then(|value| crate::db::parse_db_time(&value))
                 .map(|dt| dt.with_timezone(&chrono::Utc));
             let due = match last_run {
-                Some(last_run) => chrono::Utc::now()
-                    .signed_duration_since(last_run)
-                    .num_seconds()
-                    >= config.interval_minutes * 60,
+                Some(last_run) => {
+                    chrono::Utc::now()
+                        .signed_duration_since(last_run)
+                        .num_seconds()
+                        >= config.interval_minutes * 60
+                }
                 None => true,
             };
             if !due {
                 continue;
             }
 
-            run_forward_health_check(&state).await;
+            // 已有检查（例如管理员手动触发）在运行时跳过本次，等待下个周期。
+            let Ok(_guard) = state.forward_check_lock.clone().try_lock_owned() else {
+                continue;
+            };
+            run_forward_health_check_inner(&state).await;
         }
     });
 }
@@ -3350,13 +3524,8 @@ mod tests {
             proxied: true,
             ..Default::default()
         };
-        let (dns, rulesets) = sample_snapshot(
-            &rule,
-            dns,
-            8080,
-            r#"(http.host eq "a.example.com")"#,
-            true,
-        );
+        let (dns, rulesets) =
+            sample_snapshot(&rule, dns, 8080, r#"(http.host eq "a.example.com")"#, true);
 
         let issues = inspect_zone_forward_rules(&[rule], &dns, &rulesets);
         assert!(issues.is_empty(), "unexpected issues: {issues:?}");
@@ -3373,13 +3542,8 @@ mod tests {
             proxied: true,
             ..Default::default()
         };
-        let (dns, rulesets) = sample_snapshot(
-            &rule,
-            dns,
-            9090,
-            r#"(http.host eq "b.example.com")"#,
-            true,
-        );
+        let (dns, rulesets) =
+            sample_snapshot(&rule, dns, 9090, r#"(http.host eq "b.example.com")"#, true);
 
         let issues = inspect_zone_forward_rules(&[rule], &dns, &rulesets);
         assert_eq!(issues.len(), 2);
@@ -3399,17 +3563,74 @@ mod tests {
             proxied: true,
             ..Default::default()
         };
-        let (dns, rulesets) = sample_snapshot(
-            &rule,
-            dns,
-            8080,
-            r#"(http.host eq "a.example.com")"#,
-            true,
-        );
+        let (dns, rulesets) =
+            sample_snapshot(&rule, dns, 8080, r#"(http.host eq "a.example.com")"#, true);
 
         let issues = inspect_zone_forward_rules(&[rule], &dns, &rulesets);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].target, "Origin Rules");
+    }
+
+    #[test]
+    fn inspect_detects_external_hostname_in_expression() {
+        let rule = sample_rule("a.example.com", 8080, "192.0.2.1");
+        let dns = DnsRecord {
+            id: "dns-1".to_string(),
+            name: "a.example.com".to_string(),
+            record_type: "A".to_string(),
+            content: "192.0.2.1".to_string(),
+            proxied: true,
+            ..Default::default()
+        };
+        let (dns, rulesets) = sample_snapshot(
+            &rule,
+            dns,
+            8080,
+            r#"((http.host eq "a.example.com") or (http.host eq "intruder.example.com"))"#,
+            true,
+        );
+
+        let issues = inspect_zone_forward_rules(&[rule], &dns, &rulesets);
+        assert_eq!(issues.len(), 1, "unexpected issues: {issues:?}");
+        assert!(issues[0].message.contains("intruder.example.com"));
+    }
+
+    #[test]
+    fn inspect_ignores_expression_when_rule_and_hosts_disabled() {
+        let mut rule = sample_rule("a.example.com", 8080, "192.0.2.1");
+        rule.enabled = false;
+        let dns = DnsRecord {
+            id: "dns-1".to_string(),
+            name: "a.example.com".to_string(),
+            record_type: "A".to_string(),
+            content: "192.0.2.1".to_string(),
+            proxied: true,
+            ..Default::default()
+        };
+        let (dns, rulesets) =
+            sample_snapshot(&rule, dns, 8080, r#"(http.host eq "a.example.com")"#, false);
+
+        let issues = inspect_zone_forward_rules(&[rule], &dns, &rulesets);
+        assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+    }
+
+    #[test]
+    fn inspect_detects_rule_enabled_without_enabled_hosts() {
+        let mut rule = sample_rule("a.example.com", 8080, "192.0.2.1");
+        rule.enabled = false;
+        let dns = DnsRecord {
+            id: "dns-1".to_string(),
+            name: "a.example.com".to_string(),
+            record_type: "A".to_string(),
+            content: "192.0.2.1".to_string(),
+            proxied: true,
+            ..Default::default()
+        };
+        let (dns, rulesets) = sample_snapshot(&rule, dns, 8080, "", true);
+
+        let issues = inspect_zone_forward_rules(&[rule], &dns, &rulesets);
+        assert_eq!(issues.len(), 1, "unexpected issues: {issues:?}");
+        assert!(issues[0].message.contains("规则仍启用"));
     }
 
     #[test]
