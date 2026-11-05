@@ -192,12 +192,14 @@ pub struct OriginCertificateResponse {
     pub status: String,
 }
 
-/// 单个 Cloudflare 账号的 API 客户端（Global API Key 认证）。
+/// 单个 Cloudflare 账号的 API 客户端。
+/// 支持 Account API Token（Bearer）与旧版 Global API Key 两种认证方式。
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     pub api_key: String,
     pub email: String,
+    pub auth_type: String,
     pub account_id: i64,
     pub account_identifier: String,
     pub account_name: String,
@@ -218,6 +220,7 @@ impl Client {
                 .unwrap_or_default(),
             api_key: api_key.into(),
             email: email.into(),
+            auth_type: "global_key".to_string(),
             account_id: 0,
             account_identifier: String::new(),
             account_name: String::new(),
@@ -238,6 +241,31 @@ impl Client {
         self
     }
 
+    /// 设置认证方式，兼容数据库里的空值/历史值（未知值按 Global API Key 处理）。
+    pub fn with_auth_type(mut self, auth_type: impl Into<String>) -> Self {
+        let auth_type = auth_type.into();
+        self.auth_type = if auth_type.eq_ignore_ascii_case("token") {
+            "token".to_string()
+        } else {
+            "global_key".to_string()
+        };
+        self
+    }
+
+    fn uses_token(&self) -> bool {
+        self.auth_type.eq_ignore_ascii_case("token")
+    }
+
+    /// 分页拉取 Zone 的路径；Account API Token 模式下按账号过滤。
+    fn zones_path(&self, per_page: usize, page: usize) -> String {
+        let mut path = format!("/zones?per_page={per_page}&page={page}");
+        if self.uses_token() && !self.account_identifier.is_empty() {
+            path.push_str("&account.id=");
+            path.push_str(&self.account_identifier);
+        }
+        path
+    }
+
     async fn do_request(
         &self,
         method: reqwest::Method,
@@ -250,14 +278,27 @@ impl Client {
         } else {
             self.api_key.clone()
         };
-        tracing::info!(method = %method, path, email = %self.email, key_prefix, "[CF API]");
+        tracing::info!(
+            method = %method,
+            path,
+            auth_type = %self.auth_type,
+            email = %self.email,
+            key_prefix,
+            "[CF API]"
+        );
 
         let mut request = self
             .http
             .request(method, &url)
-            .header("Content-Type", "application/json")
-            .header("X-Auth-Key", &self.api_key)
-            .header("X-Auth-Email", &self.email);
+            .header("Content-Type", "application/json");
+
+        if self.uses_token() {
+            request = request.header("Authorization", format!("Bearer {}", self.api_key));
+        } else {
+            request = request
+                .header("X-Auth-Key", &self.api_key)
+                .header("X-Auth-Email", &self.email);
+        }
 
         if let Some(body) = body {
             request = request.json(&body);
@@ -310,7 +351,7 @@ impl Client {
 
     pub async fn list_zones(&self) -> Result<Vec<CfZone>, CfError> {
         let value = self
-            .do_request(reqwest::Method::GET, "/zones?per_page=50", None)
+            .do_request(reqwest::Method::GET, &self.zones_path(50, 1), None)
             .await?;
         serde_json::from_value(value).map_err(|e| CfError::Parse(e.to_string()))
     }
@@ -328,11 +369,7 @@ impl Client {
         let mut page = 1;
         loop {
             let value = self
-                .do_request(
-                    reqwest::Method::GET,
-                    &format!("/zones?per_page=100&page={page}"),
-                    None,
-                )
+                .do_request(reqwest::Method::GET, &self.zones_path(100, page), None)
                 .await?;
             let zones: Vec<CfZone> =
                 serde_json::from_value(value).map_err(|e| CfError::Parse(e.to_string()))?;

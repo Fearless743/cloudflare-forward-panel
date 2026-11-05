@@ -30,8 +30,19 @@ pub struct CreateAccountRequest {
     pub email: String,
     #[serde(default)]
     pub api_key: String,
+    /// token（Account API Token，默认）或 global_key（旧版 Global API Key）
+    #[serde(default)]
+    pub auth_type: String,
     #[serde(default)]
     pub account_id: String,
+}
+
+fn normalize_auth_type(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "token" | "account_token" | "account_api_token" => Some("token"),
+        "global_key" | "global" | "global_api_key" => Some("global_key"),
+        _ => None,
+    }
 }
 
 pub async fn create_account(
@@ -39,11 +50,18 @@ pub async fn create_account(
     AdminUser(_claims): AdminUser,
     ApiJson(req): ApiJson<CreateAccountRequest>,
 ) -> ApiResult<Response> {
-    if req.email.is_empty() {
-        return Err(ApiError::bad_request("email is required"));
-    }
-    if req.api_key.is_empty() {
+    let auth_type = normalize_auth_type(&req.auth_type)
+        .ok_or_else(|| ApiError::bad_request("auth_type 仅支持 token 或 global_key"))?;
+    if req.api_key.trim().is_empty() {
         return Err(ApiError::bad_request("api_key is required"));
+    }
+    if auth_type == "global_key" && req.email.trim().is_empty() {
+        return Err(ApiError::bad_request("使用 Global API Key 时邮箱必填"));
+    }
+    if auth_type == "token" && req.account_id.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "使用 Account API Token 时请填写 CF 账号 ID",
+        ));
     }
 
     let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cf_accounts")
@@ -53,12 +71,13 @@ pub async fn create_account(
 
     let now = now_db();
     let id = sqlx::query(
-        "INSERT INTO cf_accounts (name, email, api_key, account_id, is_active, is_blocked, error_msg, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO cf_accounts (name, email, api_key, auth_type, account_id, is_active, is_blocked, error_msg, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&name)
     .bind(req.email.trim())
     .bind(req.api_key.trim())
+    .bind(auth_type)
     .bind(req.account_id.trim())
     .bind(true)
     .bind(false)
@@ -90,6 +109,8 @@ pub struct UpdateAccountRequest {
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
+    pub auth_type: Option<String>,
+    #[serde(default)]
     pub account_id: Option<String>,
 }
 
@@ -115,16 +136,31 @@ pub async fn update_account(
             account.api_key = api_key.trim().to_string();
         }
     }
+    if let Some(auth_type) = req.auth_type.as_deref() {
+        account.auth_type = normalize_auth_type(auth_type)
+            .ok_or_else(|| ApiError::bad_request("auth_type 仅支持 token 或 global_key"))?
+            .to_string();
+    }
     // 使用 Option 区分「未传」与「传空字符串」：允许清空 CF 账号 ID
     if let Some(account_identifier) = req.account_id.as_deref() {
         account.account_id = account_identifier.trim().to_string();
     }
 
+    if account.auth_type == "global_key" && account.email.trim().is_empty() {
+        return Err(ApiError::bad_request("使用 Global API Key 时邮箱必填"));
+    }
+    if account.auth_type == "token" && account.account_id.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "使用 Account API Token 时请填写 CF 账号 ID",
+        ));
+    }
+
     sqlx::query(
-        "UPDATE cf_accounts SET email = ?, api_key = ?, account_id = ?, updated_at = ? WHERE id = ?",
+        "UPDATE cf_accounts SET email = ?, api_key = ?, auth_type = ?, account_id = ?, updated_at = ? WHERE id = ?",
     )
     .bind(&account.email)
     .bind(&account.api_key)
+    .bind(&account.auth_type)
     .bind(&account.account_id)
     .bind(now_db())
     .bind(account.id)
@@ -132,6 +168,7 @@ pub async fn update_account(
     .await?;
 
     state.manager.reload_accounts().await;
+    state.manager.sync_local_zones().await;
     Ok(ok_message("账号已更新"))
 }
 

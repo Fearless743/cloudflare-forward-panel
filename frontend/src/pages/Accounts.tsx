@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Table, Tag, Button, Space, Typography, Modal, Form, Input, Switch, message, Popconfirm, Alert } from 'antd'
+import { Table, Tag, Button, Space, Typography, Modal, Form, Input, Switch, Select, message, Popconfirm, Alert } from 'antd'
 import { ReloadOutlined, PlusOutlined, DeleteOutlined, EditOutlined, CheckCircleOutlined } from '@ant-design/icons'
 import { getAccounts, createAccount, updateAccount, deleteAccount, toggleAccount, unblockAccount } from '../api/client'
 import type { CFAccount } from '../types'
@@ -12,6 +12,8 @@ function Accounts() {
   const [modalOpen, setModalOpen] = useState(false)
   const [editingAccount, setEditingAccount] = useState<CFAccount | null>(null)
   const [form] = Form.useForm()
+  const authType = Form.useWatch('auth_type', form)
+  const isToken = authType !== 'global_key'
   const [deletingId, setDeletingId] = useState<number | null>(null)
 
   const fetchAccounts = async () => {
@@ -34,6 +36,7 @@ function Accounts() {
   const handleCreate = () => {
     setEditingAccount(null)
     form.resetFields()
+    form.setFieldsValue({ auth_type: 'token' })
     setModalOpen(true)
   }
 
@@ -43,6 +46,7 @@ function Accounts() {
       name: account.name,
       email: account.email,
       api_key: account.api_key,
+      auth_type: account.auth_type || 'global_key',
       account_id: account.account_id,
     })
     setModalOpen(true)
@@ -93,15 +97,17 @@ function Accounts() {
         await updateAccount(editingAccount.id, {
           email: values.email,
           api_key: values.api_key,
+          auth_type: values.auth_type,
           // 传空字符串表示清空 CF 账号 ID（undefined 会被 axios 丢弃，无法清空）
           account_id: values.account_id ?? '',
         })
         message.success('更新成功')
       } else {
         await createAccount({
-          email: values.email,
+          email: values.email || '',
           api_key: values.api_key,
-          account_id: values.account_id || undefined,
+          auth_type: values.auth_type,
+          account_id: values.account_id || '',
         })
         message.success('创建成功')
       }
@@ -132,13 +138,23 @@ function Accounts() {
       render: (text: string) => <Text strong>{text}</Text>,
     },
     {
+      title: '认证方式',
+      dataIndex: 'auth_type',
+      key: 'auth_type',
+      render: (text: string) => (
+        <Tag color={text === 'token' ? 'blue' : 'default'}>
+          {text === 'token' ? 'Account API Token' : 'Global API Key'}
+        </Tag>
+      ),
+    },
+    {
       title: '邮箱',
       dataIndex: 'email',
       key: 'email',
       render: (text: string) => <Text>{text || '-'}</Text>,
     },
     {
-      title: 'API Key',
+      title: '凭证',
       dataIndex: 'api_key',
       key: 'api_key',
       render: (text: string) => <Text code>{text}</Text>,
@@ -236,28 +252,70 @@ function Accounts() {
         cancelText="取消"
         width={500}
       >
-        <Form form={form} layout="vertical">
+        <Form form={form} layout="vertical" initialValues={{ auth_type: 'token' }}>
           <Form.Item
-            name="email"
-            label="登录邮箱"
-            rules={[{ required: true, message: '请输入 CF 登录邮箱' }]}
+            name="auth_type"
+            label="认证方式"
+            rules={[{ required: true, message: '请选择认证方式' }]}
           >
-            <Input placeholder="your@email.com" />
+            <Select
+              options={[
+                { value: 'token', label: 'Account API Token（推荐）' },
+                { value: 'global_key', label: 'Global API Key（旧版）' },
+              ]}
+            />
           </Form.Item>
-          <Form.Item
-            name="api_key"
-            label="Global API Key"
-            rules={[{ required: true, message: '请输入 Global API Key' }]}
-          >
-            <Input.Password placeholder="在 CF 控制台 - 我的资料 - API 令牌中查看" />
-          </Form.Item>
-          <Form.Item
-            name="account_id"
-            label="CF 账号 ID"
-            tooltip="创建 Zone 时需要指定账号，可在 Cloudflare 控制台找到。留空则使用默认账号"
-          >
-            <Input placeholder="例如 abc123def456（可选）" />
-          </Form.Item>
+
+          {isToken ? (
+            <>
+              <Form.Item
+                name="api_key"
+                label="Account API Token"
+                rules={[{ required: true, message: '请输入 Account API Token' }]}
+                extra="在 Cloudflare 控制台「Manage account → Account API tokens」创建，使用 cfat_ 前缀的 Token。"
+              >
+                <Input.Password placeholder="cfat_xxxxxxxxxxxxxxxx" />
+              </Form.Item>
+              <Form.Item
+                name="account_id"
+                label="CF 账号 ID"
+                rules={[{ required: true, message: '请输入 CF 账号 ID' }]}
+                tooltip="Account API Token 绑定到具体账号，需要填写对应的 Account ID"
+              >
+                <Input placeholder="例如 abc123def456" />
+              </Form.Item>
+            </>
+          ) : (
+            <>
+              <Form.Item
+                name="email"
+                label="登录邮箱"
+                rules={[{ required: true, message: '请输入 CF 登录邮箱' }]}
+              >
+                <Input placeholder="your@email.com" />
+              </Form.Item>
+              <Form.Item
+                name="api_key"
+                label="Global API Key"
+                rules={[{ required: true, message: '请输入 Global API Key' }]}
+              >
+                <Input.Password placeholder="在 CF 控制台 - 我的资料 - API 令牌中查看" />
+              </Form.Item>
+              <Form.Item
+                name="account_id"
+                label="CF 账号 ID"
+                tooltip="创建 Zone 时需要指定账号，可在 Cloudflare 控制台找到。留空则使用默认账号"
+              >
+                <Input placeholder="例如 abc123def456（可选）" />
+              </Form.Item>
+            </>
+          )}
+
+          <Alert
+            type="info"
+            showIcon
+            message="Account API Token 需要至少具备 Zone 读取/编辑、DNS 编辑、Zone Settings 编辑、Account Rulesets 编辑权限。"
+          />
         </Form>
       </Modal>
     </div>

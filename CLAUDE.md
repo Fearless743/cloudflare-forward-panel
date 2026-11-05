@@ -71,11 +71,11 @@ frontend (Vite/React18/AntD5, TS)  ——HTTP /api——>  backend-rs (Rust/axum
 
 3. **认证**：JWT（HS256，`Authorization: Bearer <token>`）。**secret 每次启动随机生成**，重启后旧 token 全部失效。角色 `admin`/`user`，通过 `AuthUser` / `AdminUser` axum extractor 区分；每次请求都会从数据库读取实时角色与启用状态，并覆盖 token 快照。默认管理员 `admin / admin123`（首次启动自动创建，`must_change_password=true`，此时仅允许调用改密接口）。
 
-4. **配置来源**：`config.rs` 只读 `DB_PATH`、`SERVER_PORT`。**CF 凭证和 Telegram 配置不读 `.env`**——CF 账号存在 `cf_accounts` 表（Global API Key + email，通过 `X-Auth-Key`/`X-Auth-Email` 头认证），Telegram 配置存在 `settings` 键值表。
+4. **配置来源**：`config.rs` 只读 `DB_PATH`、`SERVER_PORT`。**CF 凭证和 Telegram 配置不读 `.env`**——CF 账号存在 `cf_accounts` 表（`auth_type=token` 时用 `Authorization: Bearer` 的 Account API Token；`auth_type=global_key` 时用 `X-Auth-Key`/`X-Auth-Email`），Telegram 配置存在 `settings` 键值表。
 
 5. **域名分配（`zone_users`）**：管理员在「域名管理」页把域名分配给一个或多个用户（管理员也可分配给自己）。`/api/forward-rules/zones` 与自动选域逻辑只返回当前用户被分配的域名；创建/编辑规则时校验目标域名权限。
 
-6. **数据库兼容**：`db.rs` 的 `migrate()` 生成与 GORM AutoMigrate 等价的表结构，并补齐旧版本缺失的列（`must_change_password`、`cf_accounts.email/api_key/account_id`、`zones.account_id`、`forward_rules.user_id/account_id/dns_record_id`）。时间列是 GORM 格式文本；JSON 输出时统一转 RFC3339。密码使用 bcrypt，与 Go 生成的 `$2a$` 哈希兼容。
+6. **数据库兼容**：`db.rs` 的 `migrate()` 生成与 GORM AutoMigrate 等价的表结构，并补齐旧版本缺失的列（`must_change_password`、`cf_accounts.email/api_key/auth_type/account_id`、`zones.account_id`、`forward_rules.user_id/account_id/dns_record_id`）。时间列是 GORM 格式文本；JSON 输出时统一转 RFC3339。密码使用 bcrypt，与 Go 生成的 `$2a$` 哈希兼容。
 
 ### 数据模型（`src/models.rs`）
 
@@ -83,7 +83,7 @@ frontend (Vite/React18/AntD5, TS)  ——HTTP /api——>  backend-rs (Rust/axum
 
 ## 注意事项
 
-- **CF API 用 Global API Key**（`X-Auth-Key` + `X-Auth-Email`），非 API Token。错误码字符串形如 `[9106] message`，manager 依赖此格式解析封禁。
+- **CF API 认证**：默认使用 Account API Token（`Authorization: Bearer <token>`，`cf_accounts.auth_type=token`），同时兼容旧版 Global API Key（`X-Auth-Key` + `X-Auth-Email`）。错误码字符串形如 `[9106] message`，manager 依赖此格式解析封禁。
 - **敏感字段**（API key、secret）在返回前会做掩码（保留首尾各 4 位）；更新时跳过含 `****` 的值。
 - **`forward_rules.cf_rule_set_id` 是数据库列名，JSON 字段名是 `cf_ruleset_id`**，前端依赖后者。
 - 静态资源通过 `rust-embed` 从 `backend-rs/frontend/dist` 内嵌；debug 构建会直接读磁盘，release 构建在编译期内嵌，因此构建顺序很重要。

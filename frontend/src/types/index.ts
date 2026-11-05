@@ -82,6 +82,7 @@ export interface CFAccount {
   name: string
   email: string
   api_key: string
+  auth_type: 'token' | 'global_key'
   account_id: string
   is_active: boolean
   is_blocked: boolean

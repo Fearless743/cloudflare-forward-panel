@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS `cf_accounts` (
     `name` text,
     `email` text,
     `api_key` text,
+    `auth_type` text DEFAULT "global_key",
     `account_id` text,
     `is_active` numeric DEFAULT true,
     `is_blocked` numeric DEFAULT false,
@@ -131,6 +132,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS `idx_origin_cert_zone_hostnames` ON `origin_ce
         ("users", "must_change_password", "numeric DEFAULT false"),
         ("cf_accounts", "email", "text"),
         ("cf_accounts", "api_key", "text"),
+        ("cf_accounts", "auth_type", "text DEFAULT 'global_key'"),
         ("cf_accounts", "account_id", "text"),
         ("zones", "account_id", "integer"),
         ("forward_rules", "user_id", "integer"),
@@ -275,5 +277,39 @@ mod tests {
     fn placeholders_string() {
         assert_eq!(placeholders(0), "");
         assert_eq!(placeholders(3), "?,?,?");
+    }
+
+    #[tokio::test]
+    async fn migrate_backfills_auth_type_for_legacy_accounts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("legacy.db");
+        let pool = connect(&db_path.to_string_lossy()).await.expect("connect");
+
+        sqlx::query(
+            "CREATE TABLE cf_accounts (\
+             `id` integer PRIMARY KEY AUTOINCREMENT, `name` text, `email` text, `api_key` text, \
+             `account_id` text, `is_active` numeric DEFAULT true, `is_blocked` numeric DEFAULT false, \
+             `error_msg` text, `last_used` datetime, `created_at` datetime, `updated_at` datetime)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy table");
+
+        sqlx::query(
+            "INSERT INTO cf_accounts (name, email, api_key, account_id, is_active, is_blocked, error_msg) \
+             VALUES ('legacy', 'a@b.com', 'key', 'acc', 1, 0, '')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert legacy account");
+
+        migrate(&pool).await.expect("migrate");
+
+        // 旧数据默认按 Global API Key 处理，新账号由接口显式写入 token。
+        let auth_type: String = sqlx::query_scalar("SELECT auth_type FROM cf_accounts LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("read auth_type");
+        assert_eq!(auth_type, "global_key");
     }
 }

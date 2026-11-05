@@ -173,6 +173,7 @@ export interface CFAccount {
   name: string
   email: string
   api_key: string
+  auth_type: 'token' | 'global_key'
   account_id: string
   is_active: boolean
   is_blocked: boolean
@@ -182,10 +183,18 @@ export interface CFAccount {
 }
 export const getAccounts = () =>
   api.get<CFResponse<CFAccount[]>>('/accounts')
-export const createAccount = (data: { email: string; api_key: string; account_id?: string }) =>
-  api.post<CFResponse<CFAccount>>('/accounts', data)
-export const updateAccount = (id: number, data: { email?: string; api_key?: string; account_id?: string }) =>
-  api.put<CFResponse<{ message: string }>>(`/accounts/${id}`, data)
+export const createAccount = (data: {
+  email?: string
+  api_key: string
+  auth_type?: 'token' | 'global_key'
+  account_id: string
+}) => api.post<CFResponse<CFAccount>>('/accounts', data)
+export const updateAccount = (id: number, data: {
+  email?: string
+  api_key?: string
+  auth_type?: 'token' | 'global_key'
+  account_id?: string
+}) => api.put<CFResponse<{ message: string }>>(`/accounts/${id}`, data)
 export const deleteAccount = (id: number) =>
   api.delete(`/accounts/${id}`)
 export const toggleAccount = (id: number) =>

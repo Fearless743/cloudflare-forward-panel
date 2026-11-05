@@ -78,7 +78,8 @@ impl Manager {
                 .map(|acc| {
                     Arc::new(
                         Client::new(acc.api_key, acc.email, Some(self.report_tx.clone()))
-                            .with_account(acc.id, acc.name, acc.account_id),
+                            .with_account(acc.id, acc.name, acc.account_id)
+                            .with_auth_type(acc.auth_type),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -243,11 +244,9 @@ impl Manager {
             .ok()?;
         let account = account?;
         Some(Arc::new(
-            Client::new(account.api_key, account.email, None).with_account(
-                account.id,
-                account.name,
-                account.account_id,
-            ),
+            Client::new(account.api_key, account.email, None)
+                .with_account(account.id, account.name, account.account_id)
+                .with_auth_type(account.auth_type),
         ))
     }
 

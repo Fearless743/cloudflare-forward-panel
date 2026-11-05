@@ -55,6 +55,10 @@ pub struct CfAccount {
     pub name: String,
     pub email: String,
     pub api_key: String,
+    /// token = Account API Token（Authorization: Bearer）
+    /// global_key = 旧版 Global API Key（X-Auth-Key + X-Auth-Email）
+    #[sqlx(default)]
+    pub auth_type: String,
     pub account_id: String,
     pub is_active: bool,
     pub is_blocked: bool,

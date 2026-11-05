@@ -45,6 +45,8 @@ state = {
     "dns": {},
     "dns_seq": 0,
     "settings": {},
+    "last_auth": "",
+    "last_auth_key": "",
 }
 
 
@@ -87,6 +89,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].replace("/client/v4", "")
         query = self.path.split("?", 1)[1] if "?" in self.path else ""
         parts = [p for p in path.split("/") if p]
+        state["last_auth"] = self.headers.get("Authorization", "")
+        state["last_auth_key"] = self.headers.get("X-Auth-Key", "")
 
         if path == "/__state":
             self._send(200, state)
@@ -293,6 +297,14 @@ def main():
         # 创建 CF 账号（会触发 Zone 同步）
         account = req("POST", "/api/accounts", {"email": "a@b.com", "api_key": "key-123456789", "account_id": "acc"})
         check("create account", account["result"]["id"] == 1)
+        check("account defaults to account token", account["result"]["auth_type"] == "token")
+        check("token uses bearer auth", state["last_auth"].startswith("Bearer "), state["last_auth"])
+
+        # 支持在 Account API Token 与旧版 Global API Key 之间切换
+        req("PUT", "/api/accounts/1", {"auth_type": "global_key"})
+        check("switch to global key auth", state["last_auth_key"] == "key-123456789", state["last_auth_key"])
+        req("PUT", "/api/accounts/1", {"auth_type": "token"})
+        check("switch back to token auth", state["last_auth"].startswith("Bearer "), state["last_auth"])
 
         # 手动添加域名
         zone = req("POST", "/api/zones", {"account_id": 1, "domain": "example.com"})
