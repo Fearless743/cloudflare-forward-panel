@@ -325,6 +325,22 @@ def main():
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
         check("expression merged", rule1["hostname"] in rs["rules"][0]["expression"] and rule2["hostname"] in rs["rules"][0]["expression"])
 
+        # 定时检查：面板与 CF 一致时无问题
+        report = req("POST", "/api/forward-rules/check")["result"]
+        check("check clean state", report["issues"] == [], report)
+        check("check counted rules", report["checked_rules"] == 2, report)
+
+        # 人为破坏 CF 侧 DNS 与 Origin Rule，检查应发现并自动修复
+        state["dns"][rule1["dns_record_id"]]["content"] = "5.5.5.5"
+        rs = state["rulesets"][rule1["cf_ruleset_id"]]
+        rs["rules"][0]["action_parameters"]["origin"]["port"] = 1234
+        report = req("POST", "/api/forward-rules/check")["result"]
+        check("check auto fixed drift", report["fixed"] >= 2, report)
+        check("check leaves no remaining issues", report["issues"] == [], report)
+        check("check fixed dns", state["dns"][rule1["dns_record_id"]]["content"] == "1.2.3.4")
+        rs = state["rulesets"][rule1["cf_ruleset_id"]]
+        check("check fixed origin port", rs["rules"][0]["action_parameters"]["origin"]["port"] == 8080)
+
         # 禁用 rule2：表达式移除其 host，rule 仍启用
         req("POST", f"/api/forward-rules/{rule2['id']}/toggle")
         rs = state["rulesets"][rule1["cf_ruleset_id"]]

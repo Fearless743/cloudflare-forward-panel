@@ -60,6 +60,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/forward-rules/zones", get(forward::list_local_zones))
         .route(
+            "/forward-rules/check",
+            post(forward::check_forward_rules),
+        )
+        .route(
             "/forward-rules/{ruleID}",
             put(forward::update_forward_rule).delete(forward::delete_forward_rule),
         )

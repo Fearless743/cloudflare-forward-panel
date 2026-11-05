@@ -128,19 +128,44 @@ export const toggleForwardRule = (ruleId: number) =>
   api.post<CFResponse<ForwardRule>>(`/forward-rules/${ruleId}/toggle`)
 
 // Settings
+export interface ForwardCheckIssue {
+  rule_id: number
+  zone_id: string
+  zone_name: string
+  hostname: string
+  target: string
+  message: string
+}
+
+export interface ForwardCheckReport {
+  checked_at: string
+  checked_zones: number
+  checked_rules: number
+  issues: ForwardCheckIssue[]
+  fixed: number
+  errors: string[]
+}
+
 export interface PanelSettings {
   cf_api_token: string
   telegram_bot_token: string
   telegram_chat_id: string
+  check_enabled: boolean
+  check_interval_minutes: number
+  check_auto_fix: boolean
+  check_last_report: ForwardCheckReport | null
 }
 export const getSettings = () =>
   api.get<CFResponse<PanelSettings>>('/settings')
-export const updateSettings = (data: PanelSettings) =>
+export const updateSettings = (data: Partial<PanelSettings>) =>
   api.put<CFResponse<{ message: string }>>('/settings', data)
 export const testConnection = () =>
   api.post<CFResponse<{ status: string; zones_count: number }>>('/settings/test')
 export const testTelegram = () =>
   api.post<CFResponse<{ message: string }>>('/settings/test-telegram')
+// 手动触发一次 DNS / Origin Rules 检查
+export const runForwardCheck = () =>
+  api.post<CFResponse<ForwardCheckReport>>('/forward-rules/check')
 
 // Accounts
 export interface CFAccount {

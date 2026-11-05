@@ -72,7 +72,10 @@ async fn main() {
         }))
         .await;
 
-    let app = api::router(state);
+    let app = api::router(state.clone());
+
+    // 定时检查 DNS / Origin Rules 是否与面板一致（间隔与自动修复可在系统设置中调整）。
+    api::forward::spawn_forward_check_scheduler(state.clone());
 
     let addr = format!("0.0.0.0:{}", cfg.server_port);
     tracing::info!(%addr, "Server starting");

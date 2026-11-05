@@ -1,20 +1,55 @@
 import { useEffect, useState } from 'react'
-import { Card, Form, Input, Button, Space, Typography, message, Alert } from 'antd'
-import { SaveOutlined, SendOutlined } from '@ant-design/icons'
-import { getSettings, updateSettings, testTelegram } from '../api/client'
+import {
+  Card,
+  Form,
+  Input,
+  Button,
+  Space,
+  Typography,
+  message,
+  Alert,
+  Switch,
+  InputNumber,
+  Table,
+  Tag,
+} from 'antd'
+import {
+  SaveOutlined,
+  SendOutlined,
+  SafetyCertificateOutlined,
+} from '@ant-design/icons'
+import { getSettings, updateSettings, testTelegram, runForwardCheck } from '../api/client'
+import type { ForwardCheckIssue, ForwardCheckReport } from '../api/client'
 
 const { Title, Text } = Typography
+
+function formatCheckedAt(value?: string) {
+  if (!value) return '-'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+}
 
 function Settings() {
   const [loading, setLoading] = useState(false)
   const [telegramLoading, setTelegramLoading] = useState(false)
-  const [form] = Form.useForm()
+  const [checkSaving, setCheckSaving] = useState(false)
+  const [checking, setChecking] = useState(false)
+  const [checkReport, setCheckReport] = useState<ForwardCheckReport | null>(null)
+  const [telegramForm] = Form.useForm()
+  const [checkForm] = Form.useForm()
 
   const fetchSettings = async () => {
     setLoading(true)
     try {
       const res = await getSettings()
-      form.setFieldsValue(res.data.result)
+      const data = res.data.result
+      telegramForm.setFieldsValue(data)
+      checkForm.setFieldsValue({
+        check_enabled: data.check_enabled,
+        check_interval_minutes: data.check_interval_minutes,
+        check_auto_fix: data.check_auto_fix,
+      })
+      setCheckReport(data.check_last_report)
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : '加载失败'
       message.error(errorMessage)
@@ -27,16 +62,35 @@ function Settings() {
     fetchSettings()
   }, [])
 
-  const handleSave = async () => {
+  const handleSaveTelegram = async () => {
     try {
-      const values = await form.validateFields()
-      await updateSettings(values)
+      const values = await telegramForm.validateFields()
+      await updateSettings({
+        telegram_bot_token: values.telegram_bot_token,
+        telegram_chat_id: values.telegram_chat_id,
+      })
       message.success('设置已保存')
       fetchSettings()
     } catch (err: unknown) {
       if (err instanceof Error) {
         message.error(err.message)
       }
+    }
+  }
+
+  const handleSaveCheck = async () => {
+    setCheckSaving(true)
+    try {
+      const values = await checkForm.validateFields()
+      await updateSettings(values)
+      message.success('检查设置已保存')
+      fetchSettings()
+    } catch (err: unknown) {
+      if (err instanceof Error) {
+        message.error(err.message)
+      }
+    } finally {
+      setCheckSaving(false)
     }
   }
 
@@ -53,62 +107,233 @@ function Settings() {
     }
   }
 
+  const handleRunCheck = async () => {
+    setChecking(true)
+    try {
+      const res = await runForwardCheck()
+      const report = res.data.result
+      setCheckReport(report)
+      if (report.issues.length === 0) {
+        message.success(
+          report.fixed > 0
+            ? `检查完成，已自动修复 ${report.fixed} 个问题`
+            : '检查完成，DNS 与 Origin Rules 均与面板一致'
+        )
+      } else {
+        message.warning(`检查完成，仍有 ${report.issues.length} 个问题`)
+      }
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : '检查失败'
+      message.error(errorMessage)
+    } finally {
+      setChecking(false)
+    }
+  }
+
+  const issueColumns = [
+    {
+      title: '域名',
+      dataIndex: 'zone_name',
+      key: 'zone_name',
+    },
+    {
+      title: '主机名',
+      dataIndex: 'hostname',
+      key: 'hostname',
+    },
+    {
+      title: '类型',
+      dataIndex: 'target',
+      key: 'target',
+      render: (target: string) => (
+        <Tag color={target === 'DNS' ? 'blue' : 'purple'}>{target}</Tag>
+      ),
+    },
+    {
+      title: '问题',
+      dataIndex: 'message',
+      key: 'message',
+    },
+  ]
+
   return (
     <div>
       <Title level={4} style={{ marginBottom: 24 }}>系统设置</Title>
 
-      <Card title="Telegram 通知">
-        <Alert
-          message="配置 Telegram 机器人后，当 CF 账号出现异常时会发送通知"
-          type="info"
-          showIcon
-          style={{ marginBottom: 16 }}
-        />
-        <Form form={form} layout="vertical">
-          <Form.Item
-            name="telegram_bot_token"
-            label="Bot Token"
-          >
-            <Input.Password placeholder="输入 Telegram Bot Token" />
-          </Form.Item>
-          <Form.Item
-            name="telegram_chat_id"
-            label="Chat ID"
-          >
-            <Input placeholder="输入 Telegram Chat ID" />
-          </Form.Item>
-          <Form.Item>
-            <Space>
-              <Button
-                type="primary"
-                icon={<SaveOutlined />}
-                onClick={handleSave}
-                loading={loading}
+      <Space direction="vertical" size={24} style={{ display: 'flex' }}>
+        <Card title="定时检查 DNS / Origin Rules">
+          <Alert
+            message="定时对比面板中的转发规则与 Cloudflare 侧的 DNS 记录、Origin Rules；发现不一致时可自动修复并通过 Telegram 通知。"
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+          />
+          <Form form={checkForm} layout="vertical">
+            <Space size="large" wrap>
+              <Form.Item
+                name="check_enabled"
+                label="启用定时检查"
+                valuePropName="checked"
+                style={{ marginBottom: 0 }}
               >
-                保存
-              </Button>
-              <Button
-                icon={<SendOutlined />}
-                onClick={handleTestTelegram}
-                loading={telegramLoading}
+                <Switch checkedChildren="开" unCheckedChildren="关" />
+              </Form.Item>
+              <Form.Item
+                name="check_interval_minutes"
+                label="检查间隔（分钟）"
+                style={{ marginBottom: 0 }}
               >
-                测试通知
-              </Button>
+                <InputNumber min={1} max={1440} style={{ width: 160 }} />
+              </Form.Item>
+              <Form.Item
+                name="check_auto_fix"
+                label="发现不一致时自动修复"
+                valuePropName="checked"
+                style={{ marginBottom: 0 }}
+              >
+                <Switch checkedChildren="开" unCheckedChildren="关" />
+              </Form.Item>
             </Space>
-          </Form.Item>
-        </Form>
-        <Alert
-          message={
-            <Text type="secondary">
-              获取 Bot Token：在 Telegram 中搜索 @BotFather，创建机器人后获取 Token。
-              获取 Chat ID：向机器人发送消息后，访问 https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates 获取。
-            </Text>
-          }
-          type="info"
-          showIcon
-          style={{ marginTop: 16 }}
-        />
-      </Card>
+            <Form.Item style={{ marginTop: 20, marginBottom: 0 }}>
+              <Space>
+                <Button
+                  type="primary"
+                  icon={<SaveOutlined />}
+                  onClick={handleSaveCheck}
+                  loading={checkSaving}
+                >
+                  保存
+                </Button>
+                <Button
+                  icon={<SafetyCertificateOutlined />}
+                  onClick={handleRunCheck}
+                  loading={checking}
+                >
+                  立即检查
+                </Button>
+                <Text type="secondary">
+                  上次检查：{formatCheckedAt(checkReport?.checked_at)}
+                </Text>
+              </Space>
+            </Form.Item>
+          </Form>
+
+          {checkReport && (
+            <div style={{ marginTop: 20 }}>
+              {checkReport.issues.length === 0 ? (
+                <Alert
+                  type="success"
+                  showIcon
+                  message={
+                    checkReport.fixed > 0
+                      ? `检查完成，已自动修复 ${checkReport.fixed} 个问题，当前 DNS 与 Origin Rules 均与面板一致。`
+                      : '检查完成，DNS 与 Origin Rules 均与面板一致。'
+                  }
+                  description={
+                    checkReport.errors.length > 0
+                      ? `检查过程中有 ${checkReport.errors.length} 个错误，可查看服务端日志。`
+                      : undefined
+                  }
+                />
+              ) : (
+                <Alert
+                  type="warning"
+                  showIcon
+                  message={`发现 ${checkReport.issues.length} 个与面板不一致的问题${
+                    checkReport.fixed > 0 ? `（本次已修复 ${checkReport.fixed} 个）` : ''
+                  }`}
+                  description={
+                    <Text type="secondary">
+                      检查域名 {checkReport.checked_zones} 个，规则 {checkReport.checked_rules} 条。
+                      请确认自动修复已开启，或检查 Cloudflare 账号权限。
+                    </Text>
+                  }
+                />
+              )}
+
+              {checkReport.errors.length > 0 && (
+                <Alert
+                  type="error"
+                  showIcon
+                  style={{ marginTop: 12 }}
+                  message="检查错误"
+                  description={
+                    <ul style={{ margin: 0, paddingLeft: 20 }}>
+                      {checkReport.errors.map((err, index) => (
+                        <li key={`${index}-${err}`}>{err}</li>
+                      ))}
+                    </ul>
+                  }
+                />
+              )}
+
+              {checkReport.issues.length > 0 && (
+                <Table<ForwardCheckIssue>
+                  style={{ marginTop: 12 }}
+                  size="small"
+                  rowKey={(row, index) => `${row.rule_id}-${row.target}-${index}`}
+                  dataSource={checkReport.issues}
+                  columns={issueColumns}
+                  pagination={{ pageSize: 10, hideOnSinglePage: true }}
+                />
+              )}
+            </div>
+          )}
+        </Card>
+
+        <Card title="Telegram 通知">
+          <Alert
+            message="配置 Telegram 机器人后，CF 账号异常或定时检查发现不一致时会发送通知"
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+          />
+          <Form form={telegramForm} layout="vertical">
+            <Form.Item
+              name="telegram_bot_token"
+              label="Bot Token"
+            >
+              <Input.Password placeholder="输入 Telegram Bot Token" />
+            </Form.Item>
+            <Form.Item
+              name="telegram_chat_id"
+              label="Chat ID"
+            >
+              <Input placeholder="输入 Telegram Chat ID" />
+            </Form.Item>
+            <Form.Item>
+              <Space>
+                <Button
+                  type="primary"
+                  icon={<SaveOutlined />}
+                  onClick={handleSaveTelegram}
+                  loading={loading}
+                >
+                  保存
+                </Button>
+                <Button
+                  icon={<SendOutlined />}
+                  onClick={handleTestTelegram}
+                  loading={telegramLoading}
+                >
+                  测试通知
+                </Button>
+              </Space>
+            </Form.Item>
+          </Form>
+          <Alert
+            message={
+              <Text type="secondary">
+                获取 Bot Token：在 Telegram 中搜索 @BotFather，创建机器人后获取 Token。
+                获取 Chat ID：向机器人发送消息后，访问 https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates 获取。
+              </Text>
+            }
+            type="info"
+            showIcon
+            style={{ marginTop: 16 }}
+          />
+        </Card>
+      </Space>
     </div>
   )
 }

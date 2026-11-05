@@ -285,6 +285,20 @@ impl Manager {
         self.clients.read().await.len()
     }
 
+    /// 发送 Telegram 通知；返回是否成功发送（未配置时返回 false）。
+    pub async fn send_telegram(&self, text: &str) -> bool {
+        if !self.telegram.is_configured() {
+            return false;
+        }
+        match self.telegram.send_message(text).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(%err, "发送 Telegram 通知失败");
+                false
+            }
+        }
+    }
+
     /// 返回全部账号下的所有 Zone。
     pub async fn list_all_zones(&self) -> Vec<CfZone> {
         let clients = self.clients.read().await.clone();
