@@ -117,13 +117,3 @@ export interface OriginCertificate {
   request_type: string
   status: string
 }
-
-export interface DomainRegistrar {
-  id: number
-  name: string
-  type: 'porkbun' | 'spaceship'
-  api_key: string
-  is_active: boolean
-  created_at: string
-  updated_at: string
-}

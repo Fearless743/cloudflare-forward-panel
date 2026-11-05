@@ -50,10 +50,12 @@ jobs:
             type=sha,format=long
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push
+      - name: Build and push (Rust backend)
         uses: docker/build-push-action@v6
         with:
           context: .
+          # 根目录 Dockerfile 已是 Rust 多阶段构建：前端 → rust-embed → release 二进制
+          file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}

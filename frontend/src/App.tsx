@@ -11,7 +11,6 @@ import SslSettings from './pages/SslSettings'
 import Accounts from './pages/Accounts'
 import Users from './pages/Users'
 import Settings from './pages/Settings'
-import Registrars from './pages/Registrars'
 
 // 路由守卫
 function PrivateRoute({ children }: { children: React.ReactNode }) {
@@ -45,7 +44,6 @@ function App() {
             <Route path="accounts" element={<Accounts />} />
             <Route path="users" element={<Users />} />
             <Route path="settings" element={<Settings />} />
-            <Route path="registrars" element={<Registrars />} />
           </Route>
         </Routes>
       </BrowserRouter>

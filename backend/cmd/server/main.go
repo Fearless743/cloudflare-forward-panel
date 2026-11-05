@@ -42,18 +42,8 @@ func main() {
 	}
 
 	// 自动迁移
-	if err := db.AutoMigrate(&models.User{}, &models.Setting{}, &models.CFAccount{}, &models.Zone{}, &models.ZoneUser{}, &models.ForwardRule{}, &models.DomainRegistrar{}, &models.RegistrarDomain{}, &models.OriginCertificate{}); err != nil {
+	if err := db.AutoMigrate(&models.User{}, &models.Setting{}, &models.CFAccount{}, &models.Zone{}, &models.ZoneUser{}, &models.ForwardRule{}, &models.OriginCertificate{}); err != nil {
 		log.Fatalf("Failed to migrate database: %v", err)
-	}
-
-	// 旧表数据迁移：domain_import_tasks -> registrar_domains
-	if db.Migrator().HasTable("domain_import_tasks") {
-		if err := db.Exec("INSERT OR IGNORE INTO registrar_domains (id, domain, registrar_id, status, error_msg, retry_count, account_id, created_at, updated_at) SELECT id, domain, registrar_id, status, error_msg, retry_count, account_id, created_at, updated_at FROM domain_import_tasks").Error; err != nil {
-			log.Printf("迁移 domain_import_tasks 数据失败: %v", err)
-		} else {
-			db.Migrator().DropTable("domain_import_tasks")
-			log.Println("已迁移旧导入任务表数据")
-		}
 	}
 
 	// 创建默认管理员账号（如果不存在）
@@ -71,9 +61,6 @@ func main() {
 
 	// 账号被封禁时，自动迁移其名下转发规则到其他账号
 	cfManager.SetOnAccountBlocked(handler.MigrateAccountRules)
-
-	// 启动导入调度器
-	handler.StartImportScheduler()
 
 	addr := fmt.Sprintf(":%s", cfg.ServerPort)
 	log.Printf("Server starting on %s", addr)

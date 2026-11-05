@@ -61,11 +61,6 @@ function Layout() {
       label: '用户管理',
     })
     menuItems.push({
-      key: '/registrars',
-      icon: <GlobalOutlined />,
-      label: '注册商管理',
-    })
-    menuItems.push({
       key: '/settings',
       icon: <SettingOutlined />,
       label: '系统设置',

@@ -5,7 +5,6 @@ import (
 	"cloudflare-forward-panel/internal/cfclient"
 	"cloudflare-forward-panel/internal/config"
 	"cloudflare-forward-panel/internal/models"
-	registrarPkg "cloudflare-forward-panel/internal/registrar"
 	"cloudflare-forward-panel/internal/telegram"
 	"crypto/rand"
 	"encoding/json"
@@ -27,21 +26,14 @@ import (
 )
 
 type Handler struct {
-	db        *gorm.DB
-	manager   *cfclient.Manager
-	config    *config.Config
-	scheduler *ImportScheduler
+	db      *gorm.DB
+	manager *cfclient.Manager
+	config  *config.Config
 }
 
 func NewHandler(db *gorm.DB, manager *cfclient.Manager, cfg *config.Config) *Handler {
 	h := &Handler{db: db, manager: manager, config: cfg}
-	h.scheduler = NewImportScheduler(db, manager)
 	return h
-}
-
-// StartImportScheduler 启动导入调度器
-func (h *Handler) StartImportScheduler() {
-	h.scheduler.Start()
 }
 
 // getCFClient 获取当前可用的 CF 客户端
@@ -392,21 +384,6 @@ func (h *Handler) Router() *chi.Mux {
 				r.Delete("/users/{userID}", h.deleteUser)
 				r.Post("/users/{userID}/toggle", h.toggleUser)
 
-				// 域名注册商管理
-				r.Route("/registrars", func(r chi.Router) {
-					r.Get("/", h.listRegistrars)
-					r.Post("/", h.createRegistrar)
-					r.Put("/{registrarID}", h.updateRegistrar)
-					r.Delete("/{registrarID}", h.deleteRegistrar)
-					r.Post("/{registrarID}/toggle", h.toggleRegistrar)
-					r.Post("/{registrarID}/test", h.testRegistrarConnection)
-					r.Get("/{registrarID}/domains", h.listRegistrarDomains)
-					r.Get("/{registrarID}/available-domains", h.listAvailableRegistrarDomains)
-					r.Post("/{registrarID}/domains/import", h.importRegistrarDomains)
-					r.Delete("/{registrarID}/domains/{domainID}", h.deleteRegistrarDomain)
-					r.Get("/{registrarID}/tasks", h.listImportTasks)
-					r.Post("/{registrarID}/tasks/retry", h.retryImportTasks)
-				})
 			})
 		})
 	})
@@ -968,9 +945,6 @@ func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
 	// 同步新账号的 Zone 到本地表，否则新增账号的域名要重启后才能用于转发/迁移
 	h.manager.SyncLocalZones()
 
-	// 新账号可用，立即尝试处理等待中的导入任务
-	h.scheduler.Trigger()
-
 	// 若有被封禁账号遗留的规则，立即尝试迁移到新账号
 	h.migrateBlockedAccounts()
 
@@ -1103,10 +1077,9 @@ func (h *Handler) toggleAccount(w http.ResponseWriter, r *http.Request) {
 	h.db.Save(&account)
 	h.manager.ReloadAccounts()
 
-	// 启用账号时触发导入调度，并同步该账号的 Zone
+	// 启用账号时同步该账号的 Zone
 	if account.IsActive {
 		h.manager.SyncLocalZones()
-		h.scheduler.Trigger()
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
@@ -1130,9 +1103,6 @@ func (h *Handler) unblockAccount(w http.ResponseWriter, r *http.Request) {
 	h.manager.ReloadAccounts()
 	// 重新同步该账号的 Zone 归属（解封后重新拉取，确保本地 Zone 的 account_id 正确）
 	h.manager.SyncLocalZones()
-
-	// 解除封禁后立即处理等待中的导入任务
-	h.scheduler.Trigger()
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -3760,502 +3730,5 @@ func (h *Handler) generateOriginCertificate(w http.ResponseWriter, r *http.Reque
 		"success": true,
 		"cached":  false,
 		"result":  cert,
-	})
-}
-
-// listRegistrars 列出所有注册商
-func (h *Handler) listRegistrars(w http.ResponseWriter, r *http.Request) {
-	var registrars []models.DomainRegistrar
-	h.db.Find(&registrars)
-
-	// 隐藏 API Secret
-	for i := range registrars {
-		registrars[i].APISecret = maskSecret(registrars[i].APISecret)
-	}
-
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"result":  registrars,
-	})
-}
-
-// createRegistrar 创建注册商
-func (h *Handler) createRegistrar(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name      string `json:"name"`
-		Type      string `json:"type"`
-		APIKey    string `json:"api_key"`
-		APISecret string `json:"api_secret"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	if req.Name == "" || req.Type == "" || req.APIKey == "" || req.APISecret == "" {
-		respondError(w, http.StatusBadRequest, "name, type, api_key and api_secret are required")
-		return
-	}
-
-	if req.Type != "porkbun" && req.Type != "spaceship" {
-		respondError(w, http.StatusBadRequest, "type must be porkbun or spaceship")
-		return
-	}
-
-	registrar := models.DomainRegistrar{
-		Name:      req.Name,
-		Type:      req.Type,
-		APIKey:    req.APIKey,
-		APISecret: req.APISecret,
-		IsActive:  true,
-	}
-
-	if err := h.db.Create(&registrar).Error; err != nil {
-		respondError(w, http.StatusInternalServerError, "创建注册商失败: "+err.Error())
-		return
-	}
-
-	// 掩码敏感字段后再返回
-	registrar.APISecret = maskSecret(registrar.APISecret)
-
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"result":  registrar,
-	})
-}
-
-// updateRegistrar 更新注册商
-func (h *Handler) updateRegistrar(w http.ResponseWriter, r *http.Request) {
-	registrarID, err := strconv.ParseUint(chi.URLParam(r, "registrarID"), 10, 32)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid registrar ID")
-		return
-	}
-
-	var registrar models.DomainRegistrar
-	if err := h.db.First(&registrar, registrarID).Error; err != nil {
-		respondError(w, http.StatusNotFound, "注册商不存在")
-		return
-	}
-
-	var req struct {
-		Name      string `json:"name"`
-		APIKey    string `json:"api_key"`
-		APISecret string `json:"api_secret"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	if req.Name != "" {
-		registrar.Name = req.Name
-	}
-	if req.APIKey != "" && !strings.Contains(req.APIKey, "****") {
-		registrar.APIKey = req.APIKey
-	}
-	if req.APISecret != "" && !strings.Contains(req.APISecret, "****") {
-		registrar.APISecret = req.APISecret
-	}
-
-	if err := h.db.Save(&registrar).Error; err != nil {
-		respondError(w, http.StatusInternalServerError, "更新注册商失败: "+err.Error())
-		return
-	}
-
-	// 掩码敏感字段后再返回
-	registrar.APISecret = maskSecret(registrar.APISecret)
-
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"result":  registrar,
-	})
-}
-
-// deleteRegistrar 删除注册商
-func (h *Handler) deleteRegistrar(w http.ResponseWriter, r *http.Request) {
-	registrarID, err := strconv.ParseUint(chi.URLParam(r, "registrarID"), 10, 32)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid registrar ID")
-		return
-	}
-
-	var registrar models.DomainRegistrar
-	if err := h.db.First(&registrar, registrarID).Error; err != nil {
-		respondError(w, http.StatusNotFound, "注册商不存在")
-		return
-	}
-
-	// 检查该注册商下是否有域名任务，阻止删除避免产生孤儿队列记录
-	var domainCount int64
-	h.db.Model(&models.RegistrarDomain{}).Where("registrar_id = ?", registrarID).Count(&domainCount)
-	if domainCount > 0 {
-		respondError(w, http.StatusBadRequest,
-			fmt.Sprintf("该注册商下有 %d 个域名记录，请先删除所有域名记录后再删除注册商", domainCount))
-		return
-	}
-
-	tx := h.db.Begin()
-	if err := tx.Delete(&models.DomainRegistrar{}, registrarID).Error; err != nil {
-		tx.Rollback()
-		respondError(w, http.StatusInternalServerError, "删除注册商失败: "+err.Error())
-		return
-	}
-	tx.Commit()
-
-	claims := auth.GetUserFromContext(r)
-	if claims != nil {
-		log.Printf("[Admin] 管理员 %s(role=%s) 删除了注册商 %s", claims.Username, claims.Role, registrar.Name)
-	}
-
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "删除成功",
-	})
-}
-
-// toggleRegistrar 切换注册商状态
-func (h *Handler) toggleRegistrar(w http.ResponseWriter, r *http.Request) {
-	registrarID, err := strconv.ParseUint(chi.URLParam(r, "registrarID"), 10, 32)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid registrar ID")
-		return
-	}
-
-	var registrar models.DomainRegistrar
-	if err := h.db.First(&registrar, registrarID).Error; err != nil {
-		respondError(w, http.StatusNotFound, "注册商不存在")
-		return
-	}
-
-	registrar.IsActive = !registrar.IsActive
-	if err := h.db.Save(&registrar).Error; err != nil {
-		respondError(w, http.StatusInternalServerError, "切换状态失败: "+err.Error())
-		return
-	}
-
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"result":  registrar,
-	})
-}
-
-// testRegistrarConnection 测试注册商连接
-func (h *Handler) testRegistrarConnection(w http.ResponseWriter, r *http.Request) {
-	registrarID, err := strconv.ParseUint(chi.URLParam(r, "registrarID"), 10, 32)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid registrar ID")
-		return
-	}
-
-	var registrar models.DomainRegistrar
-	if err := h.db.First(&registrar, registrarID).Error; err != nil {
-		respondError(w, http.StatusNotFound, "注册商不存在")
-		return
-	}
-
-	client := registrarPkg.GetClient(registrar.Type, registrar.APIKey, registrar.APISecret)
-	if client == nil {
-		respondError(w, http.StatusBadRequest, "不支持的注册商类型")
-		return
-	}
-
-	if testErr := client.TestConnection(); testErr != nil {
-		respondError(w, http.StatusInternalServerError, "连接测试失败: "+testErr.Error())
-		return
-	}
-
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "连接测试成功",
-	})
-}
-
-// listRegistrarDomains 列出注册商下已添加的域名（来自数据库表，非注册商 API）
-func (h *Handler) listRegistrarDomains(w http.ResponseWriter, r *http.Request) {
-	registrarID, err := strconv.ParseUint(chi.URLParam(r, "registrarID"), 10, 32)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid registrar ID")
-		return
-	}
-
-	// 只返回该注册商下手动添加过的域名
-	var domains []models.RegistrarDomain
-	if err := h.db.Where("registrar_id = ?", registrarID).Order("id DESC").Find(&domains).Error; err != nil {
-		respondError(w, http.StatusInternalServerError, "查询失败: "+err.Error())
-		return
-	}
-
-	// 收集所有 CF 账号下已存在的域名，标记是否已接入
-	existing := h.manager.ListAllZoneNames()
-	existingSet := make(map[string]bool)
-	for _, name := range existing {
-		existingSet[strings.ToLower(name)] = true
-	}
-
-	result := make([]map[string]interface{}, 0, len(domains))
-	for _, d := range domains {
-		lower := strings.ToLower(d.Domain)
-		result = append(result, map[string]interface{}{
-			"id":           d.ID,
-			"domain":       d.Domain,
-			"status":       d.Status,
-			"error_msg":    d.ErrorMsg,
-			"retry_count":  d.RetryCount,
-			"exists":       existingSet[lower],
-			"queued":       d.Status == "pending" || d.Status == "processing",
-			"registrar_id": d.RegistrarID,
-		})
-	}
-
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"result":  result,
-	})
-}
-
-// deleteRegistrarDomain 删除注册商下已添加的域名记录（仅删除本地记录，不操作 CF/注册商）
-func (h *Handler) deleteRegistrarDomain(w http.ResponseWriter, r *http.Request) {
-	registrarID, err := strconv.ParseUint(chi.URLParam(r, "registrarID"), 10, 32)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid registrar ID")
-		return
-	}
-	domainID, err := strconv.ParseUint(chi.URLParam(r, "domainID"), 10, 32)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid domain ID")
-		return
-	}
-
-	// 先查询域名记录状态，processing 中的任务禁止删除（避免与调度器竞态）
-	var domain models.RegistrarDomain
-	if err := h.db.Where("id = ? AND registrar_id = ?", domainID, registrarID).First(&domain).Error; err != nil {
-		respondError(w, http.StatusNotFound, "域名记录不存在")
-		return
-	}
-	if domain.Status == "processing" {
-		respondError(w, http.StatusBadRequest, "该域名正在导入中，请稍后再试")
-		return
-	}
-
-	// 已成功导入的域名删除后，CF Zone 不会自动清理，需提醒用户
-	if domain.Status == "success" || domain.Status == "partial" {
-		log.Printf("[Registrar] 警告：删除已成功导入的域名 %s，CF Zone 仍保留在 Cloudflare 中，需手动清理", domain.Domain)
-	}
-
-	result := h.db.Where("id = ? AND registrar_id = ?", domainID, registrarID).Delete(&models.RegistrarDomain{})
-	if result.Error != nil {
-		respondError(w, http.StatusInternalServerError, "删除失败: "+result.Error.Error())
-		return
-	}
-	if result.RowsAffected == 0 {
-		respondError(w, http.StatusNotFound, "域名记录不存在")
-		return
-	}
-
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "删除成功",
-	})
-}
-
-// listAvailableRegistrarDomains 从注册商 API 拉取全部域名，
-// 并标记每个域名是否已添加/已接入，供勾选添加
-func (h *Handler) listAvailableRegistrarDomains(w http.ResponseWriter, r *http.Request) {
-	registrarID, err := strconv.ParseUint(chi.URLParam(r, "registrarID"), 10, 32)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid registrar ID")
-		return
-	}
-
-	var registrar models.DomainRegistrar
-	if err := h.db.First(&registrar, registrarID).Error; err != nil {
-		respondError(w, http.StatusNotFound, "注册商不存在")
-		return
-	}
-
-	client := registrarPkg.GetClient(registrar.Type, registrar.APIKey, registrar.APISecret)
-	if client == nil {
-		respondError(w, http.StatusBadRequest, "不支持的注册商类型")
-		return
-	}
-
-	domains, err := client.ListDomains()
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, "拉取域名失败: "+err.Error())
-		return
-	}
-
-	// 已添加过（在数据库表中）
-	var added []models.RegistrarDomain
-	h.db.Find(&added)
-	addedSet := make(map[string]bool)
-	for _, a := range added {
-		addedSet[strings.ToLower(a.Domain)] = true
-	}
-
-	// 已接入 CF
-	existing := h.manager.ListAllZoneNames()
-	existingSet := make(map[string]bool)
-	for _, name := range existing {
-		existingSet[strings.ToLower(name)] = true
-	}
-
-	result := make([]map[string]interface{}, 0, len(domains))
-	for _, d := range domains {
-		lower := strings.ToLower(d)
-		result = append(result, map[string]interface{}{
-			"domain":       d,
-			"added":        addedSet[lower],
-			"exists":       existingSet[lower],
-			"registrar_id": registrar.ID,
-		})
-	}
-
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"result":  result,
-	})
-}
-
-// importRegistrarDomains 批量导入域名到 CF 队列
-// 请求体: {"domains": ["example.com", ...]}
-// 域名会先写入导入队列，由后台调度器异步处理
-func (h *Handler) importRegistrarDomains(w http.ResponseWriter, r *http.Request) {
-	registrarID, err := strconv.ParseUint(chi.URLParam(r, "registrarID"), 10, 32)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid registrar ID")
-		return
-	}
-
-	var registrar models.DomainRegistrar
-	if err := h.db.First(&registrar, registrarID).Error; err != nil {
-		respondError(w, http.StatusNotFound, "注册商不存在")
-		return
-	}
-	if !registrar.IsActive {
-		respondError(w, http.StatusBadRequest, "注册商已禁用")
-		return
-	}
-
-	var req struct {
-		Domains []string `json:"domains"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if len(req.Domains) == 0 {
-		respondError(w, http.StatusBadRequest, "domains is required")
-		return
-	}
-
-	// 收集所有 CF 已有域名
-	existingSet := make(map[string]bool)
-	for _, name := range h.manager.ListAllZoneNames() {
-		existingSet[strings.ToLower(name)] = true
-	}
-
-	results := make([]map[string]interface{}, 0, len(req.Domains))
-	successCount := 0
-	skipCount := 0
-	failCount := 0
-
-	for _, domain := range req.Domains {
-		domain = strings.TrimSpace(strings.ToLower(domain))
-		if domain == "" {
-			continue
-		}
-
-		// 已存在的跳过
-		if existingSet[domain] {
-			results = append(results, map[string]interface{}{
-				"domain":  domain,
-				"status":  "skipped",
-				"message": "已在 CF 中",
-			})
-			skipCount++
-			continue
-		}
-
-		// 入队（唯一约束防重复）
-		task := models.RegistrarDomain{
-			Domain:      domain,
-			RegistrarID: uint(registrarID),
-			Status:      "pending",
-		}
-		if err := h.db.Create(&task).Error; err != nil {
-			if isUniqueConstraintErr(err) {
-				results = append(results, map[string]interface{}{
-					"domain":  domain,
-					"status":  "skipped",
-					"message": "已在排队中",
-				})
-				skipCount++
-			} else {
-				results = append(results, map[string]interface{}{
-					"domain":  domain,
-					"status":  "failed",
-					"message": "入队失败: " + err.Error(),
-				})
-				failCount++
-			}
-			continue
-		}
-
-		results = append(results, map[string]interface{}{
-			"domain":  domain,
-			"status":  "queued",
-			"message": "已加入导入队列",
-		})
-		successCount++
-	}
-
-	// 触发调度器立即处理
-	h.scheduler.Trigger()
-
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"result": map[string]interface{}{
-			"results": results,
-			"success": successCount,
-			"skipped": skipCount,
-			"failed":  failCount,
-		},
-	})
-}
-
-// listImportTasks 查询导入任务列表
-func (h *Handler) listImportTasks(w http.ResponseWriter, r *http.Request) {
-	// 路由位于 /registrars/{registrarID}/tasks，优先使用路径参数
-	registrarID := chi.URLParam(r, "registrarID")
-	if registrarID == "" {
-		registrarID = r.URL.Query().Get("registrar_id")
-	}
-	var tasks []models.RegistrarDomain
-	query := h.db.Order("created_at DESC").Limit(200)
-	if registrarID != "" {
-		query = query.Where("registrar_id = ?", registrarID)
-	}
-	if err := query.Find(&tasks).Error; err != nil {
-		respondError(w, http.StatusInternalServerError, "查询失败: "+err.Error())
-		return
-	}
-
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"result":  tasks,
-	})
-}
-
-// retryImportTasks 重置失败/跳过/部分成功的导入任务回队列重新处理
-func (h *Handler) retryImportTasks(w http.ResponseWriter, r *http.Request) {
-	registrarID, _ := strconv.ParseUint(chi.URLParam(r, "registrarID"), 10, 32)
-	count := h.scheduler.RetryFailed(uint(registrarID))
-	message := fmt.Sprintf("已将 %d 个任务重新加入队列", count)
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": message,
-		"result":  map[string]string{"message": message},
 	})
 }

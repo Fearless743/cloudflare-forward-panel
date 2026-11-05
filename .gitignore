@@ -12,6 +12,14 @@ dist/
 *.so
 *.dylib
 
+# Rust
+backend-rs/target/
+bin/server-rs
+
+# Python（e2e 测试）
+__pycache__/
+*.pyc
+
 # 数据库
 *.db
 *.db-wal

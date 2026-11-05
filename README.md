@@ -1,6 +1,8 @@
 # Cloudflare 转发面板
 
-基于 React + Go 的 Cloudflare 管理面板，支持多账号管理、域名管理、DNS 记录、端口转发（Origin Rules）、SSL/TLS 配置，以及通过 Porkbun/Spaceship 注册商批量导入域名并接入 Cloudflare。
+基于 Rust + React 的 Cloudflare 管理面板，支持多账号管理、域名管理、DNS 记录、端口转发（Origin Rules）与 SSL/TLS 配置。
+
+> 后端已从 Go 重写为 Rust（`backend-rs/`）。旧的 Go 实现保留在 `backend/` 目录，便于对照与回滚。
 
 ## 功能特性
 
@@ -9,7 +11,6 @@
 - **DNS 记录**：A、AAAA、CNAME、MX、TXT 等记录类型的增删改查
 - **端口转发**：基于 Cloudflare Origin Rules，自动生成随机子域名 + DNS 记录 + SSL 全量模式；同端口多目标复用同一条规则
 - **SSL/TLS**：配置域名的加密模式（关闭、灵活、完全、完全-严格）
-- **域名导入**：从 Porkbun / Spaceship 批量拉取域名，异步接入 Cloudflare 并更新注册商 NS
 - **用户与订阅**：多用户、角色权限（admin/user）、订阅过期自动停用转发规则
 - **Telegram 通知**：账号异常时推送告警
 
@@ -17,7 +18,7 @@
 
 | 组件 | 技术 |
 |------|------|
-| 后端 | Go 1.26、Chi Router、GORM、SQLite |
+| 后端 | Rust 1.82+、axum、sqlx、SQLite |
 | 前端 | Vite + React 18 + TypeScript、Ant Design 5 |
 | 认证 | JWT（首次登录强制修改默认密码） |
 | 部署 | 单二进制（前端静态资源内嵌）、Docker、GitHub Actions |
@@ -40,8 +41,8 @@ SERVER_PORT=8080
 ### 本地开发
 
 ```bash
-# 后端（端口 8080）
-cd backend && go run ./cmd/server
+# 后端（Rust，端口 8080）
+cd backend-rs && cargo run
 
 # 前端（端口 3000，自动代理 /api 到 8080）
 cd frontend && bun install && bun run dev
@@ -50,6 +51,18 @@ cd frontend && bun install && bun run dev
 访问 http://localhost:3000
 
 > 首次启动会创建默认管理员 `admin / admin123`，登录后**强制要求修改密码**。
+> 数据库结构与旧 Go 版完全兼容，可直接使用已有的 `cloudflare.db`。
+> 旧 Go 版默认把数据库放在 `backend/data/cloudflare.db`；在 `backend-rs` 目录运行时可设置
+> `DB_PATH=../backend/data/cloudflare.db cargo run` 直接复用。
+
+### 测试
+
+```bash
+cd backend-rs
+cargo test                 # 单元测试（表达式解析、时间、bcrypt/JWT、订阅解析等）
+cargo build
+python3 tests/e2e_mock.py  # 端到端测试：真实服务 + 有状态 Cloudflare API mock
+```
 
 ### 生产部署（Docker Compose）
 
@@ -65,31 +78,41 @@ docker compose up -d
 # 1. 构建前端（产物输出到 frontend/dist）
 cd frontend && bun run build
 
-# 2. 拷贝前端产物到 embed 路径
-cd ../backend && mkdir -p cmd/server/frontend/dist && cp -r ../frontend/dist/* cmd/server/frontend/dist/
+# 2. 拷贝前端产物到 rust-embed 路径
+cd .. && rm -rf backend-rs/frontend/dist && mkdir -p backend-rs/frontend/dist
+cp -r frontend/dist/. backend-rs/frontend/dist/
 
-# 3. 构建后端（前端已内嵌）
-go build -o ../bin/server ./cmd/server
+# 3. 构建 Rust 后端（前端已内嵌）
+cd backend-rs && cargo build --release
 
 # 4. 运行
-./bin/server
+./target/release/server
 ```
+
+也可以直接执行根目录的 `make build`（自动完成上述步骤并输出到 `bin/server-rs`）。
 
 ## 项目结构
 
 ```
 cloudflare-forward-panel/
-├── backend/                    # Go 后端
-│   ├── cmd/server/main.go      # 入口（内嵌前端静态资源）
-│   ├── internal/
-│   │   ├── api/                # HTTP 路由和处理器（router.go 集中全部 handler）
+├── backend-rs/                 # Rust 后端（当前使用）
+│   ├── src/
+│   │   ├── main.rs             # 入口（内嵌前端静态资源）
+│   │   ├── api/                # HTTP 路由与处理器
+│   │   │   ├── mod.rs          # 路由注册、CORS、静态资源
+│   │   │   ├── forward.rs      # 端口转发核心逻辑
+│   │   │   ├── zones.rs        # 域名 / DNS / SSL
+│   │   │   ├── accounts.rs     # CF 账号管理
+│   │   │   ├── users.rs        # 用户管理
+│   │   │   └── settings.rs     # 系统设置
 │   │   ├── cfclient/           # Cloudflare API 客户端 + 多账号管理器
-│   │   ├── registrar/          # 注册商客户端（porkbun / spaceship）
-│   │   ├── telegram/           # Telegram 通知
-│   │   ├── auth/               # JWT 认证
-│   │   ├── config/             # 配置加载
-│   │   └── models/             # GORM 数据模型
-│   └── go.mod
+│   │   ├── telegram.rs         # Telegram 通知
+│   │   ├── auth.rs             # JWT / bcrypt
+│   │   ├── db.rs               # SQLite 连接与自动迁移
+│   │   ├── models.rs           # 数据模型
+│   │   └── config.rs           # 配置加载
+│   └── Cargo.toml
+├── backend/                    # Go 旧后端（仅保留对照，不再默认构建）
 ├── frontend/                   # React 前端
 │   ├── src/
 │   │   ├── api/client.ts       # API 客户端（集中全部请求）
@@ -139,7 +162,6 @@ cloudflare-forward-panel/
 | PATCH | `/api/zones/{id}/ssl` | 更新 SSL 设置 | 管理员 |
 | POST | `/api/origin-certificates` | 生成 Origin 证书 | 管理员 |
 | GET/POST/PUT/DELETE | `/api/users` | 用户管理 | 管理员 |
-| GET/POST/PUT/DELETE | `/api/registrars` | 注册商管理 | 管理员 |
 
 ## 端口转发说明
 

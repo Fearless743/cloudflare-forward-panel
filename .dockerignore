@@ -12,6 +12,12 @@ backend/bin
 backend/*.db
 backend/*.db-wal
 backend/*.db-shm
+backend-rs/target
+backend-rs/data
+backend-rs/frontend/dist
+backend-rs/*.db
+backend-rs/*.db-wal
+backend-rs/*.db-shm
 
 # 前端
 frontend/node_modules
