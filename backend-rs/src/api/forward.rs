@@ -507,6 +507,24 @@ async fn sync_rule_expression(
     client: &Client,
     rule: &ForwardRule,
 ) -> FResult<()> {
+    sync_rule_expression_inner(state, client, rule, true).await
+}
+
+/// 严格按面板数据重建表达式（不保留面板外手工主机名），用于定时检查自动修复。
+async fn sync_rule_expression_strict(
+    state: &AppState,
+    client: &Client,
+    rule: &ForwardRule,
+) -> FResult<()> {
+    sync_rule_expression_inner(state, client, rule, false).await
+}
+
+async fn sync_rule_expression_inner(
+    state: &AppState,
+    client: &Client,
+    rule: &ForwardRule,
+    preserve_external: bool,
+) -> FResult<()> {
     let rows = sqlx::query_as::<_, ForwardRule>(
         "SELECT * FROM forward_rules WHERE cf_rule_set_id = ? AND cf_rule_id = ?",
     )
@@ -536,7 +554,9 @@ async fn sync_rule_expression(
         return Err(ApiError::internal("Cloudflare 规则不存在"));
     };
 
-    hosts.extend(external_hostnames(state, rule, &full.rules[idx].expression).await?);
+    if preserve_external {
+        hosts.extend(external_hostnames(state, rule, &full.rules[idx].expression).await?);
+    }
 
     if hosts.is_empty() {
         full.rules[idx].enabled = false;
@@ -2502,7 +2522,7 @@ async fn repair_zone_forward_rules(
                 continue;
             }
         }
-        if let Err(err) = sync_rule_expression(state, client, row).await {
+        if let Err(err) = sync_rule_expression_strict(state, client, row).await {
             errors.push(format!("修复 {} 的 Origin Rule 失败: {}", row.hostname, err.message));
         }
     }

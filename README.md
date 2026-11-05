@@ -10,7 +10,7 @@
 - **域名管理**：查看 Cloudflare 账户下的所有域名、NS 服务器与套餐信息
 - **DNS 记录**：A、AAAA、CNAME、MX、TXT 等记录类型的增删改查
 - **端口转发**：基于 Cloudflare Origin Rules，自动生成随机子域名 + DNS 记录 + SSL 全量模式；同端口多目标复用同一条规则
-- **定时检查**：按可配置间隔对比面板与 Cloudflare 的 DNS 记录、Origin Rules，可自动修复不一致并推送 Telegram 通知
+- **定时检查**：按可配置间隔对比面板与 Cloudflare 的 DNS 记录、Origin Rules；一致时跳过，不一致时按面板修改，缺失时自动创建，并推送 Telegram 通知
 - **SSL/TLS**：配置域名的加密模式（关闭、灵活、完全、完全-严格）
 - **用户与订阅**：多用户、角色权限（admin/user）、订阅过期自动停用转发规则
 - **Telegram 通知**：账号异常时推送告警

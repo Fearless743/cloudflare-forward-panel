@@ -163,7 +163,7 @@ function Settings() {
       <Space direction="vertical" size={24} style={{ display: 'flex' }}>
         <Card title="定时检查 DNS / Origin Rules">
           <Alert
-            message="定时对比面板中的转发规则与 Cloudflare 侧的 DNS 记录、Origin Rules；发现不一致时可自动修复并通过 Telegram 通知。"
+            message="定时对比面板中的转发规则与 Cloudflare 侧的 DNS 记录、Origin Rules；一致时不做修改，不一致时按面板配置修改，缺失时自动创建。开启自动修复后会严格以面板为准，面板外手工添加的主机名也会被移除。"
             type="info"
             showIcon
             style={{ marginBottom: 16 }}
