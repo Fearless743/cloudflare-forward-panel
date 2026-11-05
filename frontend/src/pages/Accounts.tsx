@@ -270,8 +270,8 @@ function Accounts() {
           >
             <Select
               options={[
-                { value: 'token', label: 'Account API Token（推荐）' },
-                { value: 'global_key', label: 'Global API Key（旧版）' },
+                { value: 'token', label: 'API Token（推荐，优先尝试 cfut_）' },
+                { value: 'global_key', label: 'Global API Key（旧版，兼容性最好）' },
               ]}
             />
           </Form.Item>
@@ -280,17 +280,17 @@ function Accounts() {
             <>
               <Form.Item
                 name="api_key"
-                label="Account API Token"
-                rules={[{ required: true, message: '请输入 Account API Token' }]}
-                extra="在 Cloudflare 控制台「Manage account → Account API tokens」创建，使用 cfat_ 前缀的 Token。"
+                label="API Token"
+                rules={[{ required: true, message: '请输入 API Token' }]}
+                extra="支持 Account API Token（cfat_，Manage account → Account API tokens）或 User API Token（cfut_，My Profile → API Tokens）。若使用 cfat_ 遇到 Origin Rules/DNS「request is not authorized」，请改用 cfut_ 的 User API Token（Zone Resources 包含目标域名）或 Global API Key。"
               >
-                <Input.Password placeholder="cfat_xxxxxxxxxxxxxxxx" onChange={handleApiKeyChange} />
+                <Input.Password placeholder="cfat_xxx / cfut_xxx" onChange={handleApiKeyChange} />
               </Form.Item>
               <Form.Item
                 name="account_id"
                 label="CF 账号 ID"
                 rules={[{ required: true, message: '请输入 CF 账号 ID' }]}
-                tooltip="Account API Token 绑定到具体账号，需要填写对应的 Account ID"
+                tooltip="Token 绑定到具体账号时需要填写对应的 Account ID"
               >
                 <Input placeholder="例如 abc123def456" />
               </Form.Item>

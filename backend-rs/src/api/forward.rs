@@ -22,15 +22,30 @@ fn ce(err: CfError) -> ApiError {
     ApiError::internal(err.to_string())
 }
 
-/// 给 Cloudflare 认证错误补充可操作提示。
-fn cf_action_error(action: &str, err: CfError) -> ApiError {
-    let text = err.to_string();
-    let hint = if text.contains("[10000]") {
-        "（认证失败：cfk_ 开头的 Global API Key 请使用 Global API Key 认证并填写邮箱；cfat_/cfut_ 开头的 Token 请检查权限和 Zone 资源范围）"
+fn cf_action_hint(text: &str) -> &'static str {
+    let lower = text.to_ascii_lowercase();
+    if text.contains("[10000]") || lower.contains("authentication error") {
+        "（认证失败：cfk_ 开头的 Global API Key 请使用 Global API Key 认证并填写邮箱；cfat_/cfut_ 开头的 Token 请检查权限、资源范围和有效期）"
+    } else if lower.contains("not authorized") || lower.contains("unauthorized") {
+        "（授权失败：Token 已通过认证但无权访问该资源。若使用 cfat_ 开头的 Account API Token，Cloudflare 对 zone-level Origin Rules/Rulesets 的授权可能不完整，建议改用「My Profile → API Tokens」创建的 User API Token（cfut_，权限含 Zone:DNS Edit、Account:Account Rulesets Edit/Zone Rulesets 相关权限，资源包含目标域名或全部 Zone），或改用 Global API Key（cfk_ + 邮箱）；同时确认 Token 的 Zone Resources 包含目标域名）"
     } else {
         ""
-    };
-    ApiError::internal(format!("{action}失败{hint}: {err}"))
+    }
+}
+
+fn cf_action_error_message(action: &str, err: &CfError) -> String {
+    let text = err.to_string();
+    format!("{action}失败{}: {text}", cf_action_hint(&text))
+}
+
+fn cf_action_error_text(action: &str, message: impl AsRef<str>) -> ApiError {
+    let text = message.as_ref();
+    ApiError::internal(format!("{action}失败{}: {text}", cf_action_hint(text)))
+}
+
+/// 给 Cloudflare API 错误补充可操作提示。
+fn cf_action_error(action: &str, err: CfError) -> ApiError {
+    ApiError::internal(cf_action_error_message(action, &err))
 }
 
 // ---------------------------------------------------------------------------
@@ -254,13 +269,50 @@ pub fn parse_hostname_list(expr: &str) -> Vec<String> {
     out
 }
 
+fn escape_cf_host_literal(host: &str) -> String {
+    let mut out = String::with_capacity(host.len());
+    for c in host.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn is_valid_hostname(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+fn is_valid_origin_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() || host.len() > 253 || host.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\'' | '\\' | '/' | '?' | '#' | '@')) {
+        return false;
+    }
+    host.parse::<std::net::IpAddr>().is_ok() || is_valid_hostname(host)
+}
+
 /// 根据多个主机名构建 http.host 匹配表达式（排序保证稳定）。
 pub fn build_host_expression(hostnames: &[String]) -> String {
     let mut uniq = Vec::new();
     let mut seen = HashSet::new();
     for host in hostnames {
-        if !host.is_empty() && seen.insert(host.clone()) {
-            uniq.push(host.clone());
+        let host = host.trim();
+        if !host.is_empty() && seen.insert(host.to_string()) {
+            uniq.push(host.to_string());
         }
     }
     uniq.sort();
@@ -269,11 +321,11 @@ pub fn build_host_expression(hostnames: &[String]) -> String {
         return String::new();
     }
     if uniq.len() == 1 {
-        return format!("(http.host eq \"{}\")", uniq[0]);
+        return format!("(http.host eq \"{}\")", escape_cf_host_literal(&uniq[0]));
     }
     let parts: Vec<String> = uniq
         .iter()
-        .map(|h| format!("(http.host eq \"{h}\")"))
+        .map(|h| format!("(http.host eq \"{}\")", escape_cf_host_literal(h)))
         .collect();
     format!("({})", parts.join(" or "))
 }
@@ -557,7 +609,7 @@ async fn sync_rule_expression_inner(
             if is_10001(&e) {
                 ApiError::internal("Cloudflare 规则不存在")
             } else {
-                ApiError::internal(format!("获取 Cloudflare 规则失败: {e}"))
+                cf_action_error("获取 Cloudflare 规则", e)
             }
         })?;
 
@@ -579,7 +631,7 @@ async fn sync_rule_expression_inner(
     client
         .update_origin_ruleset(&rule.zone_id, &rule.cf_rule_set_id, &full)
         .await
-        .map_err(|e| ApiError::internal(format!("更新 Cloudflare 规则失败: {e}")))?;
+        .map_err(|e| cf_action_error("更新 Cloudflare 规则", e))?;
     Ok(())
 }
 
@@ -700,7 +752,13 @@ async fn remove_hostname_from_rule(
     let mut full = client
         .get_origin_ruleset(&rule.zone_id, &rule.cf_rule_set_id)
         .await
-        .map_err(|e| ApiError::internal(format!("获取 Cloudflare 规则失败: {e}")))?;
+        .map_err(|e| {
+            if is_10001(&e) {
+                ApiError::internal("Cloudflare 规则不存在")
+            } else {
+                cf_action_error("获取 Cloudflare 规则", e)
+            }
+        })?;
     let Some(idx) = find_rule_index(&full.rules, &rule.cf_rule_id) else {
         return Err(ApiError::internal("Cloudflare 规则不存在"));
     };
@@ -716,7 +774,7 @@ async fn remove_hostname_from_rule(
     client
         .update_origin_ruleset(&rule.zone_id, &rule.cf_rule_set_id, &full)
         .await
-        .map_err(|e| ApiError::internal(format!("更新 Cloudflare 规则失败: {e}")))?;
+        .map_err(|e| cf_action_error("更新 Cloudflare 规则", e))?;
     Ok(())
 }
 
@@ -1081,7 +1139,7 @@ pub async fn create_forward_rule(
 
     let (created, is_new) = ensure_origin_ruleset(&client, &best_zone.cf_id, &ruleset)
         .await
-        .map_err(|e| ApiError::internal(format!("创建 Cloudflare 规则失败: {}", e.message)))?;
+        .map_err(|e| cf_action_error_text("创建 Cloudflare 规则", &e.message))?;
 
     let record_type = detect_dns_record_type(&req.origin_host);
     let created_dns = match client
@@ -1254,13 +1312,16 @@ pub async fn update_forward_rule(
     State(state): State<Arc<AppState>>,
     Path(rule_id): Path<i64>,
     AuthUser(claims): AuthUser,
-    ApiJson(req): ApiJson<ForwardRuleRequest>,
+    ApiJson(mut req): ApiJson<ForwardRuleRequest>,
 ) -> ApiResult<Response> {
-    if !(1..=65535).contains(&req.origin_port) || req.origin_host.is_empty() {
-        return Err(ApiError::bad_request(
-            "origin_port 必须在 1-65535 之间，origin_host 不能为空",
-        ));
+    if !(1..=65535).contains(&req.origin_port) {
+        return Err(ApiError::bad_request("origin_port 必须在 1-65535 之间"));
     }
+    let origin_host = req.origin_host.trim();
+    if origin_host.is_empty() || !is_valid_origin_host(origin_host) {
+        return Err(ApiError::bad_request("origin_host 格式无效，请填写合法 IP 或域名"));
+    }
+    req.origin_host = origin_host.to_string();
 
     let mut local_rule =
         sqlx::query_as::<_, ForwardRule>("SELECT * FROM forward_rules WHERE id = ?")
@@ -1412,9 +1473,7 @@ async fn change_rule_port_in_same_zone(
         // 独占：先改 CF 端口，再同步目标地址与表达式。
         update_rule_port(client, rule, new_port)
             .await
-            .map_err(|e| {
-                ApiError::internal(format!("修改 Cloudflare 规则端口失败: {}", e.message))
-            })?;
+            .map_err(|e| cf_action_error_text("修改 Cloudflare 规则端口", &e.message))?;
         let new_dns_id = update_rule_dns_record(client, rule, new_host)
             .await
             .map_err(|e| ApiError::internal(format!("更新 DNS 记录失败: {}", e.message)))?;
@@ -1437,9 +1496,7 @@ async fn change_rule_port_in_same_zone(
     )]);
     let (created, _) = ensure_origin_ruleset(client, &old.zone_id, &ruleset)
         .await
-        .map_err(|e| {
-            ApiError::internal(format!("为新端口创建 Cloudflare 规则失败: {}", e.message))
-        })?;
+        .map_err(|e| cf_action_error_text("为新端口创建 Cloudflare 规则", &e.message))?;
 
     let mut new_rule_id = find_rule_id_by_port(&created.rules, new_port);
     if new_rule_id.is_empty() && created.rules.len() == 1 {
@@ -1852,7 +1909,7 @@ async fn reconcile_zone_forward_rules(
     let existing_list = client
         .list_origin_rulesets(zone_id)
         .await
-        .map_err(|e| ApiError::internal(format!("列出 Cloudflare 规则失败: {e}")))?;
+        .map_err(|e| cf_action_error("列出 Cloudflare 规则", e))?;
 
     let mut ruleset_map: HashMap<String, OriginRuleset> = HashMap::new();
     for ruleset in &existing_list {
@@ -2490,7 +2547,7 @@ async fn repair_zone_forward_rules(
     let dns_records = match client.list_dns_records(zone_id, "").await {
         Ok(records) => records,
         Err(err) => {
-            errors.push(format!("列出 DNS 记录失败: {err}"));
+            errors.push(cf_action_error_message("列出 DNS 记录", &err));
             Vec::new()
         }
     };
