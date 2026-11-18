@@ -17,6 +17,7 @@ use crate::cfclient::Client;
 pub mod accounts;
 pub mod auth_handlers;
 pub mod certs;
+pub mod ech;
 pub mod extractors;
 pub mod forward;
 pub mod rate_limit;
@@ -31,6 +32,8 @@ pub struct AppState {
     pub rate_limiter: rate_limit::RateLimiter,
     /// 保证定时检查与手动检查不会并发执行，避免重复修复产生冲突记录。
     pub forward_check_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// 保证 ECH 定时巡检与手动触发不会并发执行。
+    pub ech_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 /// {"success": true, "message": ...}
@@ -89,6 +92,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/settings/test", post(settings::test_connection))
         .route("/settings/test-telegram", post(settings::test_telegram))
+        // ---- ECH（自动开启） ----
+        .route("/ech/enable", post(ech::enable_ech_all))
+        .route("/ech/status", get(ech::ech_status))
         // ---- 账号管理 ----
         .route(
             "/accounts",

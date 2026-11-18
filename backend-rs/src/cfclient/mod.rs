@@ -183,6 +183,16 @@ pub struct SslSetting {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct EchSetting {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub editable: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct OriginCertificateResponse {
     #[serde(default)]
     pub id: String,
@@ -297,6 +307,18 @@ impl Client {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, CfError> {
+        self.do_request_inner(method, path, body, true).await
+    }
+
+    /// 与 do_request 相同，但可选择不把 API 错误上报给 Manager。
+    /// ECH 等可选设置可能因套餐或权限被拒绝，不应触发账号切换或封禁。
+    async fn do_request_inner(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        report_errors: bool,
+    ) -> Result<Value, CfError> {
         let url = format!("{}{path}", self.base_url);
         let key_prefix = if self.api_key.len() > 4 {
             format!("{}...", &self.api_key[..4])
@@ -358,7 +380,7 @@ impl Client {
                 .iter()
                 .map(|e| format!("[{}] {} ", e.code, e.message))
                 .collect();
-            if self.account_id > 0 {
+            if report_errors && self.account_id > 0 {
                 if let Some(tx) = &self.reporter {
                     let _ = tx.send(ReportEvent {
                         account_id: self.account_id,
@@ -640,6 +662,21 @@ impl Client {
         )
         .await?;
         Ok(())
+    }
+
+    /// 开启或关闭指定 Zone 的 Encrypted Client Hello (ECH)。
+    /// PATCH 是幂等的：重复设置为同一值不会报错，因此无需先 GET 当前状态。
+    /// 该设置可能因套餐或权限不可用，错误不上报 Manager，避免影响账号轮询。
+    pub async fn set_ech(&self, zone_id: &str, value: &str) -> Result<EchSetting, CfError> {
+        let result = self
+            .do_request_inner(
+                reqwest::Method::PATCH,
+                &format!("/zones/{zone_id}/settings/ech"),
+                Some(json!({ "value": value })),
+                false,
+            )
+            .await?;
+        serde_json::from_value(result).map_err(|e| CfError::Parse(e.to_string()))
     }
 
     // ---------------- Origin Certificate ----------------

@@ -24,8 +24,10 @@ import {
   testTelegram,
   runForwardCheck,
   getForwardCheckStatus,
+  enableEchAll,
+  getEchStatus,
 } from '../api/client'
-import type { ForwardCheckIssue, ForwardCheckReport } from '../api/client'
+import type { ForwardCheckIssue, ForwardCheckReport, EchReport } from '../api/client'
 
 const { Title, Text } = Typography
 
@@ -54,14 +56,35 @@ async function waitForForwardCheck(): Promise<ForwardCheckReport | null> {
   return null
 }
 
+// ECH 批量开启在后台执行，轮询状态直到完成（最多等待 10 分钟）。
+async function waitForEchEnable(): Promise<EchReport | null> {
+  const deadline = Date.now() + 10 * 60 * 1000
+  while (Date.now() < deadline) {
+    await sleep(2000)
+    try {
+      const res = await getEchStatus()
+      if (!res.data.result.running) {
+        return res.data.result.last_report
+      }
+    } catch {
+      // 网络抖动时继续轮询，避免一次失败就中断等待。
+    }
+  }
+  return null
+}
+
 function Settings() {
   const [loading, setLoading] = useState(false)
   const [telegramLoading, setTelegramLoading] = useState(false)
   const [checkSaving, setCheckSaving] = useState(false)
   const [checking, setChecking] = useState(false)
   const [checkReport, setCheckReport] = useState<ForwardCheckReport | null>(null)
+  const [echSaving, setEchSaving] = useState(false)
+  const [echEnabling, setEchEnabling] = useState(false)
+  const [echReport, setEchReport] = useState<EchReport | null>(null)
   const [telegramForm] = Form.useForm()
   const [checkForm] = Form.useForm()
+  const [echForm] = Form.useForm()
 
   const fetchSettings = async () => {
     setLoading(true)
@@ -74,7 +97,12 @@ function Settings() {
         check_interval_minutes: data.check_interval_minutes,
         check_auto_fix: data.check_auto_fix,
       })
+      echForm.setFieldsValue({
+        ech_auto_enable: data.ech_auto_enable,
+        ech_check_interval_minutes: data.ech_check_interval_minutes,
+      })
       setCheckReport(data.check_last_report)
+      setEchReport(data.ech_last_report)
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : '加载失败'
       message.error(errorMessage)
@@ -116,6 +144,47 @@ function Settings() {
       }
     } finally {
       setCheckSaving(false)
+    }
+  }
+
+  const handleSaveEch = async () => {
+    setEchSaving(true)
+    try {
+      const values = await echForm.validateFields()
+      await updateSettings(values)
+      message.success('ECH 设置已保存')
+      fetchSettings()
+    } catch (err: unknown) {
+      if (err instanceof Error) {
+        message.error(err.message)
+      }
+    } finally {
+      setEchSaving(false)
+    }
+  }
+
+  const handleEnableEch = async () => {
+    setEchEnabling(true)
+    try {
+      await enableEchAll()
+      const report = await waitForEchEnable()
+      if (!report) {
+        message.info('开启任务仍在后台运行，请稍后刷新页面查看结果')
+        return
+      }
+      setEchReport(report)
+      if (report.errors.length === 0) {
+        message.success(`已为 ${report.enabled} 个域名开启 ECH`)
+      } else {
+        message.warning(
+          `已为 ${report.enabled} 个域名开启 ECH，${report.errors.length} 个失败`
+        )
+      }
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : '开启失败'
+      message.error(errorMessage)
+    } finally {
+      setEchEnabling(false)
     }
   }
 
@@ -309,6 +378,71 @@ function Settings() {
                 />
               )}
             </div>
+          )}
+        </Card>
+
+        <Card title="自动开启 ECH（Encrypted Client Hello）">
+          <Alert
+            message="开启后，系统会自动为所有已同步域名开启 ECH，并在添加新域名时立即开启。定时巡检会按间隔复核，确保未被外部关闭。个别套餐或权限不支持时会在结果中列出失败原因，不影响其他域名。"
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+          />
+          <Form form={echForm} layout="vertical">
+            <Space size="large" wrap>
+              <Form.Item
+                name="ech_auto_enable"
+                label="自动开启 / 定时复核"
+                valuePropName="checked"
+                style={{ marginBottom: 0 }}
+              >
+                <Switch checkedChildren="开" unCheckedChildren="关" />
+              </Form.Item>
+              <Form.Item
+                name="ech_check_interval_minutes"
+                label="复核间隔（分钟）"
+                style={{ marginBottom: 0 }}
+              >
+                <InputNumber min={30} max={10080} style={{ width: 160 }} />
+              </Form.Item>
+            </Space>
+            <Form.Item style={{ marginTop: 20, marginBottom: 0 }}>
+              <Space>
+                <Button
+                  type="primary"
+                  icon={<SaveOutlined />}
+                  onClick={handleSaveEch}
+                  loading={echSaving}
+                >
+                  保存
+                </Button>
+                <Button
+                  icon={<SafetyCertificateOutlined />}
+                  onClick={handleEnableEch}
+                  loading={echEnabling}
+                >
+                  {echEnabling ? '开启中…' : '立即为所有域名开启'}
+                </Button>
+              </Space>
+            </Form.Item>
+          </Form>
+
+          {echReport && (
+            <Alert
+              style={{ marginTop: 16 }}
+              type={echReport.errors.length === 0 ? 'success' : 'warning'}
+              showIcon
+              message={`上次执行：${formatCheckedAt(echReport.checked_at)}，共检查 ${echReport.checked_zones} 个域名，成功开启 ${echReport.enabled} 个`}
+              description={
+                echReport.errors.length > 0 ? (
+                  <ul style={{ margin: 0, paddingLeft: 20 }}>
+                    {echReport.errors.map((err, index) => (
+                      <li key={`${index}-${err}`}>{err}</li>
+                    ))}
+                  </ul>
+                ) : undefined
+              }
+            />
           )}
         </Card>
 

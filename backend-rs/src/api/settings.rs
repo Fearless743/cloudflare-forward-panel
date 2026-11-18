@@ -73,6 +73,20 @@ pub async fn get_settings(
         .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
         .unwrap_or(serde_json::Value::Null);
 
+    let ech_auto_enable = setting_value(&state, "ech_auto_enable")
+        .await
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    let ech_check_interval_minutes = setting_value(&state, "ech_check_interval")
+        .await
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(360)
+        .clamp(30, 10080);
+    let ech_last_report = setting_value(&state, "ech_last_report")
+        .await
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+        .unwrap_or(serde_json::Value::Null);
+
     Ok(ok_json(json!({
         "success": true,
         "result": {
@@ -83,6 +97,9 @@ pub async fn get_settings(
             "check_interval_minutes": check_interval_minutes,
             "check_auto_fix": check_auto_fix,
             "check_last_report": check_last_report,
+            "ech_auto_enable": ech_auto_enable,
+            "ech_check_interval_minutes": ech_check_interval_minutes,
+            "ech_last_report": ech_last_report,
         }
     })))
 }
@@ -101,6 +118,10 @@ pub struct UpdateSettingsRequest {
     pub check_interval_minutes: Option<i64>,
     #[serde(default)]
     pub check_auto_fix: Option<bool>,
+    #[serde(default)]
+    pub ech_auto_enable: Option<bool>,
+    #[serde(default)]
+    pub ech_check_interval_minutes: Option<i64>,
 }
 
 pub(crate) async fn save_setting(
@@ -164,6 +185,20 @@ pub async fn update_settings(
             if auto_fix { "true" } else { "false" },
         )
         .await?;
+    }
+
+    if let Some(enabled) = req.ech_auto_enable {
+        save_setting(
+            &state,
+            "ech_auto_enable",
+            if enabled { "true" } else { "false" },
+        )
+        .await?;
+    }
+
+    if let Some(interval) = req.ech_check_interval_minutes {
+        let interval = interval.clamp(30, 10080);
+        save_setting(&state, "ech_check_interval", &interval.to_string()).await?;
     }
 
     state.manager.reload_accounts().await;

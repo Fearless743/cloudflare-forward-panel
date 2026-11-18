@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end test: real Rust server + stateful mock Cloudflare API."""
+
 """端到端测试：真实 Rust 服务 + 有状态的 Cloudflare API mock。
 
 用法：
@@ -116,7 +117,16 @@ class Handler(BaseHTTPRequestHandler):
         if parts[:1] == ["zones"] and len(parts) == 4 and parts[2] == "rulesets":
             rs = state["rulesets"].get(parts[3])
             if rs is None:
-                self._send(404, {"success": False, "errors": [{"code": 10001, "message": "could not find ruleset"}], "result": None})
+                self._send(
+                    404,
+                    {
+                        "success": False,
+                        "errors": [
+                            {"code": 10001, "message": "could not find ruleset"}
+                        ],
+                        "result": None,
+                    },
+                )
             else:
                 self._cf(rs)
             return
@@ -126,7 +136,14 @@ class Handler(BaseHTTPRequestHandler):
             self._cf(records)
             return
 
-        self._send(404, {"success": False, "errors": [{"code": 9999, "message": "not found"}], "result": None})
+        self._send(
+            404,
+            {
+                "success": False,
+                "errors": [{"code": 9999, "message": "not found"}],
+                "result": None,
+            },
+        )
 
     def do_POST(self):
         path = self.path.split("?")[0].replace("/client/v4", "")
@@ -134,7 +151,9 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
 
         if path == "/zones":
-            existing = next((z for z in state["zones"] if z["name"] == body.get("name")), None)
+            existing = next(
+                (z for z in state["zones"] if z["name"] == body.get("name")), None
+            )
             if existing:
                 self._cf(existing)
                 return
@@ -168,18 +187,27 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/certificates":
-            self._cf({
-                "id": "cert-1",
-                "certificate": "-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----\n",
-                "hostnames": body.get("hostnames", []),
-                "issuer": "Cloudflare, Inc.",
-                "expires_on": "2040-01-01T00:00:00Z",
-                "request_type": "origin-rsa",
-                "status": "active",
-            })
+            self._cf(
+                {
+                    "id": "cert-1",
+                    "certificate": "-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----\n",
+                    "hostnames": body.get("hostnames", []),
+                    "issuer": "Cloudflare, Inc.",
+                    "expires_on": "2040-01-01T00:00:00Z",
+                    "request_type": "origin-rsa",
+                    "status": "active",
+                }
+            )
             return
 
-        self._send(404, {"success": False, "errors": [{"code": 9999, "message": "not found"}], "result": None})
+        self._send(
+            404,
+            {
+                "success": False,
+                "errors": [{"code": 9999, "message": "not found"}],
+                "result": None,
+            },
+        )
 
     def do_PUT(self):
         path = self.path.split("?")[0].replace("/client/v4", "")
@@ -194,7 +222,14 @@ class Handler(BaseHTTPRequestHandler):
             self._cf(rs)
             return
 
-        self._send(404, {"success": False, "errors": [{"code": 9999, "message": "not found"}], "result": None})
+        self._send(
+            404,
+            {
+                "success": False,
+                "errors": [{"code": 9999, "message": "not found"}],
+                "result": None,
+            },
+        )
 
     def do_PATCH(self):
         path = self.path.split("?")[0].replace("/client/v4", "")
@@ -204,9 +239,22 @@ class Handler(BaseHTTPRequestHandler):
         if parts[:1] == ["zones"] and len(parts) == 4 and parts[2] == "dns_records":
             record = state["dns"].get(parts[3])
             if not record:
-                self._send(404, {"success": False, "errors": [{"code": 10001, "message": "not found"}], "result": None})
+                self._send(
+                    404,
+                    {
+                        "success": False,
+                        "errors": [{"code": 10001, "message": "not found"}],
+                        "result": None,
+                    },
+                )
                 return
-            record.update({k: v for k, v in body.items() if k in ("name", "type", "content", "ttl", "proxied")})
+            record.update(
+                {
+                    k: v
+                    for k, v in body.items()
+                    if k in ("name", "type", "content", "ttl", "proxied")
+                }
+            )
             self._cf(record)
             return
 
@@ -216,7 +264,14 @@ class Handler(BaseHTTPRequestHandler):
             self._cf(setting)
             return
 
-        self._send(404, {"success": False, "errors": [{"code": 9999, "message": "not found"}], "result": None})
+        self._send(
+            404,
+            {
+                "success": False,
+                "errors": [{"code": 9999, "message": "not found"}],
+                "result": None,
+            },
+        )
 
     def do_DELETE(self):
         path = self.path.split("?")[0].replace("/client/v4", "")
@@ -229,7 +284,14 @@ class Handler(BaseHTTPRequestHandler):
             state["rulesets"].pop(parts[3], None)
             self._cf({"id": parts[3]})
             return
-        self._send(404, {"success": False, "errors": [{"code": 9999, "message": "not found"}], "result": None})
+        self._send(
+            404,
+            {
+                "success": False,
+                "errors": [{"code": 9999, "message": "not found"}],
+                "result": None,
+            },
+        )
 
 
 BASE = f"http://127.0.0.1:{PORT}"
@@ -251,7 +313,9 @@ def req(method, path, body=None, expect=200, auth=True):
         payload = json.loads(err.read() or b"{}")
         status = err.code
     if status != expect:
-        raise AssertionError(f"{method} {path}: got HTTP {status} {payload}, want {expect}")
+        raise AssertionError(
+            f"{method} {path}: got HTTP {status} {payload}, want {expect}"
+        )
     return payload
 
 
@@ -274,6 +338,17 @@ def run_check():
     raise AssertionError("forward check did not finish in time")
 
 
+def run_ech_enable():
+    """触发后台 ECH 批量开启并轮询到完成，返回最近一次报告。"""
+    req("POST", "/api/ech/enable")
+    for _ in range(200):
+        status = req("GET", "/api/ech/status")["result"]
+        if not status["running"]:
+            return status["last_report"]
+        time.sleep(0.05)
+    raise AssertionError("ech enable did not finish in time")
+
+
 def wait_port(port):
     for _ in range(100):
         with socket.socket() as s:
@@ -289,41 +364,94 @@ def main():
     threading.Thread(target=mock.serve_forever, daemon=True).start()
 
     env = dict(os.environ)
-    env.update({
-        "DB_PATH": DB,
-        "SERVER_PORT": str(PORT),
-        "CF_API_BASE_URL": f"http://127.0.0.1:{MOCK_PORT}/client/v4",
-        "RUST_LOG": "warn",
-    })
-    server = subprocess.Popen([SERVER], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    env.update(
+        {
+            "DB_PATH": DB,
+            "SERVER_PORT": str(PORT),
+            "CF_API_BASE_URL": f"http://127.0.0.1:{MOCK_PORT}/client/v4",
+            "RUST_LOG": "warn",
+        }
+    )
+    server = subprocess.Popen(
+        [SERVER], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    )
     try:
         wait_port(PORT)
 
-        login = req("POST", "/api/auth/login", {"username": "admin", "password": "admin123"}, auth=False)
+        login = req(
+            "POST",
+            "/api/auth/login",
+            {"username": "admin", "password": "admin123"},
+            auth=False,
+        )
         token = login["result"]["token"]
-        req("POST", "/api/auth/change-password", {"old_password": "admin123", "new_password": "admin456"})
-        login = req("POST", "/api/auth/login", {"username": "admin", "password": "admin456"}, auth=False)
+        req(
+            "POST",
+            "/api/auth/change-password",
+            {"old_password": "admin123", "new_password": "admin456"},
+        )
+        login = req(
+            "POST",
+            "/api/auth/login",
+            {"username": "admin", "password": "admin456"},
+            auth=False,
+        )
         token = login["result"]["token"]
 
         # 创建 CF 账号（会触发 Zone 同步）
-        account = req("POST", "/api/accounts", {"email": "a@b.com", "api_key": "key-123456789", "account_id": "acc"})
+        account = req(
+            "POST",
+            "/api/accounts",
+            {"email": "a@b.com", "api_key": "key-123456789", "account_id": "acc"},
+        )
         check("create account", account["result"]["id"] == 1)
-        check("account defaults to account token", account["result"]["auth_type"] == "token")
-        check("token uses bearer auth", state["last_auth"].startswith("Bearer "), state["last_auth"])
+        check(
+            "account defaults to account token",
+            account["result"]["auth_type"] == "token",
+        )
+        check(
+            "token uses bearer auth",
+            state["last_auth"].startswith("Bearer "),
+            state["last_auth"],
+        )
 
         # 支持在 Account API Token 与旧版 Global API Key 之间切换
         req("PUT", "/api/accounts/1", {"auth_type": "global_key"})
-        check("switch to global key auth", state["last_auth_key"] == "key-123456789", state["last_auth_key"])
+        check(
+            "switch to global key auth",
+            state["last_auth_key"] == "key-123456789",
+            state["last_auth_key"],
+        )
         req("PUT", "/api/accounts/1", {"auth_type": "token"})
-        check("switch back to token auth", state["last_auth"].startswith("Bearer "), state["last_auth"])
+        check(
+            "switch back to token auth",
+            state["last_auth"].startswith("Bearer "),
+            state["last_auth"],
+        )
 
         # 凭证前缀自动识别：cfk_ 必须走 Global API Key，cfat_ 走 Bearer
-        req("PUT", "/api/accounts/1", {"api_key": "cfk_e2e_test_key", "auth_type": "token"})
-        check("cfk key forces global auth", state["last_auth_key"] == "cfk_e2e_test_key", state["last_auth_key"])
+        req(
+            "PUT",
+            "/api/accounts/1",
+            {"api_key": "cfk_e2e_test_key", "auth_type": "token"},
+        )
+        check(
+            "cfk key forces global auth",
+            state["last_auth_key"] == "cfk_e2e_test_key",
+            state["last_auth_key"],
+        )
         acct = req("GET", "/api/accounts")["result"][0]
         check("cfk key stored as global_key", acct["auth_type"] == "global_key", acct)
-        req("PUT", "/api/accounts/1", {"api_key": "cfat_e2e_test_token", "auth_type": "global_key"})
-        check("cfat key forces bearer auth", state["last_auth"].startswith("Bearer "), state["last_auth"])
+        req(
+            "PUT",
+            "/api/accounts/1",
+            {"api_key": "cfat_e2e_test_token", "auth_type": "global_key"},
+        )
+        check(
+            "cfat key forces bearer auth",
+            state["last_auth"].startswith("Bearer "),
+            state["last_auth"],
+        )
         acct = req("GET", "/api/accounts")["result"][0]
         check("cfat key stored as token", acct["auth_type"] == "token", acct)
 
@@ -331,9 +459,54 @@ def main():
         zone = req("POST", "/api/zones", {"account_id": 1, "domain": "example.com"})
         zone_id = zone["result"]["id"]
         check("create zone", zone_id == "zone-1", zone_id)
-        check("zone nameservers", zone["result"]["name_servers"] == ["ns1.example.net", "ns2.example.net"])
-        check("zone not duplicated", req("POST", "/api/zones", {"account_id": 1, "domain": "example.com"})["existed"] is True)
-        bad = req("POST", "/api/zones", {"account_id": 1, "domain": "bad_domain"}, expect=400)
+        check(
+            "zone nameservers",
+            zone["result"]["name_servers"] == ["ns1.example.net", "ns2.example.net"],
+        )
+        check(
+            "zone not duplicated",
+            req("POST", "/api/zones", {"account_id": 1, "domain": "example.com"})[
+                "existed"
+            ]
+            is True,
+        )
+        bad = req(
+            "POST", "/api/zones", {"account_id": 1, "domain": "bad_domain"}, expect=400
+        )
+
+        # 添加域名后自动开启 ECH；外部关闭后可手动批量恢复
+        check(
+            "ech auto enabled on create",
+            state["settings"].get("ech", {}).get("value") == "on",
+            state["settings"],
+        )
+        state["settings"]["ech"]["value"] = "off"
+        ech_report = run_ech_enable()
+        check(
+            "ech manual enable all",
+            ech_report["enabled"] >= 1 and state["settings"]["ech"]["value"] == "on",
+            ech_report,
+        )
+        ech_settings = req("GET", "/api/settings")["result"]
+        check(
+            "ech settings defaults",
+            ech_settings["ech_auto_enable"] is True
+            and ech_settings["ech_check_interval_minutes"] == 360,
+            ech_settings,
+        )
+        req(
+            "PUT",
+            "/api/settings",
+            {"ech_auto_enable": False, "ech_check_interval_minutes": 60},
+        )
+        ech_settings = req("GET", "/api/settings")["result"]
+        check(
+            "ech settings saved",
+            ech_settings["ech_auto_enable"] is False
+            and ech_settings["ech_check_interval_minutes"] == 60,
+            ech_settings,
+        )
+        req("PUT", "/api/settings", {"ech_auto_enable": True})
 
         # 分配域名给 admin
         req("PUT", f"/api/zones/{zone_id}/users", {"user_ids": [1]})
@@ -341,22 +514,39 @@ def main():
         check("assigned zone visible", len(zones) == 1 and zones[0]["cf_id"] == zone_id)
 
         # 创建第一条转发规则
-        rule1 = req("POST", "/api/forward-rules", {"origin_port": 8080, "origin_host": "1.2.3.4", "enabled": True})["result"]
+        rule1 = req(
+            "POST",
+            "/api/forward-rules",
+            {"origin_port": 8080, "origin_host": "1.2.3.4", "enabled": True},
+        )["result"]
         check("rule1 created", rule1["origin_port"] == 8080)
         check("rule1 dns is A", state["dns"][rule1["dns_record_id"]]["type"] == "A")
-        check("ssl set to full", state["settings"].get("ssl", {}).get("value") == "full")
+        check(
+            "ssl set to full", state["settings"].get("ssl", {}).get("value") == "full"
+        )
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
         check("ruleset has one rule", len(rs["rules"]) == 1)
         check("rule1 expression", rule1["hostname"] in rs["rules"][0]["expression"])
         check("rule1 cf_rule_id", rule1["cf_rule_id"] == rs["rules"][0]["id"])
 
         # 同端口第二个目标：复用同一条 CF rule
-        rule2 = req("POST", "/api/forward-rules", {"origin_port": 8080, "origin_host": "origin.example.com", "enabled": True})["result"]
+        rule2 = req(
+            "POST",
+            "/api/forward-rules",
+            {"origin_port": 8080, "origin_host": "origin.example.com", "enabled": True},
+        )["result"]
         check("rule2 reuses ruleset", rule2["cf_ruleset_id"] == rule1["cf_ruleset_id"])
         check("rule2 reuses rule", rule2["cf_rule_id"] == rule1["cf_rule_id"])
-        check("rule2 dns is CNAME", state["dns"][rule2["dns_record_id"]]["type"] == "CNAME")
+        check(
+            "rule2 dns is CNAME",
+            state["dns"][rule2["dns_record_id"]]["type"] == "CNAME",
+        )
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
-        check("expression merged", rule1["hostname"] in rs["rules"][0]["expression"] and rule2["hostname"] in rs["rules"][0]["expression"])
+        check(
+            "expression merged",
+            rule1["hostname"] in rs["rules"][0]["expression"]
+            and rule2["hostname"] in rs["rules"][0]["expression"],
+        )
 
         # 定时检查：面板与 CF 一致时无问题
         report = run_check()
@@ -370,17 +560,31 @@ def main():
         report = run_check()
         check("check auto fixed drift", report["fixed"] >= 2, report)
         check("check leaves no remaining issues", report["issues"] == [], report)
-        check("check fixed dns", state["dns"][rule1["dns_record_id"]]["content"] == "1.2.3.4")
+        check(
+            "check fixed dns",
+            state["dns"][rule1["dns_record_id"]]["content"] == "1.2.3.4",
+        )
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
-        check("check fixed origin port", rs["rules"][0]["action_parameters"]["origin"]["port"] == 8080)
+        check(
+            "check fixed origin port",
+            rs["rules"][0]["action_parameters"]["origin"]["port"] == 8080,
+        )
 
         # 表达式丢失主机名：应按面板重建
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
         rs["rules"][0]["expression"] = f'(http.host eq "{rule2["hostname"]}")'
         report = run_check()
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
-        check("check fixed missing hostname", rule1["hostname"] in rs["rules"][0]["expression"], report)
-        check("check kept sibling hostname", rule2["hostname"] in rs["rules"][0]["expression"], report)
+        check(
+            "check fixed missing hostname",
+            rule1["hostname"] in rs["rules"][0]["expression"],
+            report,
+        )
+        check(
+            "check kept sibling hostname",
+            rule2["hostname"] in rs["rules"][0]["expression"],
+            report,
+        )
 
         # 表达式混入面板外主机名：严格修复应移除，恢复成面板配置
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
@@ -389,8 +593,17 @@ def main():
         )
         report = run_check()
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
-        check("check removed external hostname", "intruder.example.com" not in rs["rules"][0]["expression"], report)
-        check("check restored panel hostnames", rule1["hostname"] in rs["rules"][0]["expression"] and rule2["hostname"] in rs["rules"][0]["expression"], report)
+        check(
+            "check removed external hostname",
+            "intruder.example.com" not in rs["rules"][0]["expression"],
+            report,
+        )
+        check(
+            "check restored panel hostnames",
+            rule1["hostname"] in rs["rules"][0]["expression"]
+            and rule2["hostname"] in rs["rules"][0]["expression"],
+            report,
+        )
 
         # 仅多出面板外主机名、面板主机名都在：也应检测并移除
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
@@ -400,8 +613,17 @@ def main():
         )
         report = run_check()
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
-        check("check removed extra-only hostname", "intruder2.example.com" not in rs["rules"][0]["expression"], report)
-        check("check kept all panel hostnames", rule1["hostname"] in rs["rules"][0]["expression"] and rule2["hostname"] in rs["rules"][0]["expression"], report)
+        check(
+            "check removed extra-only hostname",
+            "intruder2.example.com" not in rs["rules"][0]["expression"],
+            report,
+        )
+        check(
+            "check kept all panel hostnames",
+            rule1["hostname"] in rs["rules"][0]["expression"]
+            and rule2["hostname"] in rs["rules"][0]["expression"],
+            report,
+        )
 
         # 规则被停用：应重新启用
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
@@ -422,15 +644,32 @@ def main():
         state["dns"][rule1["dns_record_id"]]["type"] = "CNAME"
         state["dns"][rule1["dns_record_id"]]["content"] = "wrong.example.com"
         run_check()
-        check("check removed wrong-type dns", rule1["dns_record_id"] not in state["dns"], state["dns"])
-        rebuilt_dns = [r for r in state["dns"].values() if r["name"] == rule1["hostname"]]
-        check("check rebuilt dns type", len(rebuilt_dns) == 1 and rebuilt_dns[0]["type"] == "A", rebuilt_dns)
-        check("check rebuilt dns content", rebuilt_dns and rebuilt_dns[0]["content"] == "1.2.3.4", rebuilt_dns)
+        check(
+            "check removed wrong-type dns",
+            rule1["dns_record_id"] not in state["dns"],
+            state["dns"],
+        )
+        rebuilt_dns = [
+            r for r in state["dns"].values() if r["name"] == rule1["hostname"]
+        ]
+        check(
+            "check rebuilt dns type",
+            len(rebuilt_dns) == 1 and rebuilt_dns[0]["type"] == "A",
+            rebuilt_dns,
+        )
+        check(
+            "check rebuilt dns content",
+            rebuilt_dns and rebuilt_dns[0]["content"] == "1.2.3.4",
+            rebuilt_dns,
+        )
 
         # 禁用 rule2：表达式移除其 host，rule 仍启用
         req("POST", f"/api/forward-rules/{rule2['id']}/toggle")
         rs = state["rulesets"][rule1["cf_ruleset_id"]]
-        check("disabled host removed", rule2["hostname"] not in rs["rules"][0]["expression"])
+        check(
+            "disabled host removed",
+            rule2["hostname"] not in rs["rules"][0]["expression"],
+        )
         check("rule stays enabled", rs["rules"][0]["enabled"] is True)
 
         # 两个都禁用：整条 rule 禁用
@@ -443,44 +682,99 @@ def main():
         req("POST", f"/api/forward-rules/{rule2['id']}/toggle")
 
         # 修改 rule1 端口：从共享规则拆分为独立规则
-        updated = req("PUT", f"/api/forward-rules/{rule1['id']}", {"origin_port": 9090, "origin_host": "1.2.3.4", "enabled": True})["result"]
-        check("rule1 moved to new ruleset", updated["cf_ruleset_id"] != rule2["cf_ruleset_id"])
+        updated = req(
+            "PUT",
+            f"/api/forward-rules/{rule1['id']}",
+            {"origin_port": 9090, "origin_host": "1.2.3.4", "enabled": True},
+        )["result"]
+        check(
+            "rule1 moved to new ruleset",
+            updated["cf_ruleset_id"] != rule2["cf_ruleset_id"],
+        )
         old_rs = state["rulesets"][rule2["cf_ruleset_id"]]
-        check("old rule keeps rule2 only", rule1["hostname"] not in old_rs["rules"][0]["expression"] and rule2["hostname"] in old_rs["rules"][0]["expression"])
+        check(
+            "old rule keeps rule2 only",
+            rule1["hostname"] not in old_rs["rules"][0]["expression"]
+            and rule2["hostname"] in old_rs["rules"][0]["expression"],
+        )
         new_rs = state["rulesets"][updated["cf_ruleset_id"]]
-        check("new rule port 9090", new_rs["rules"][0]["action_parameters"]["origin"]["port"] == 9090)
+        check(
+            "new rule port 9090",
+            new_rs["rules"][0]["action_parameters"]["origin"]["port"] == 9090,
+        )
 
         # rule2 改到 9090：并入 rule1 的新规则
-        merged = req("PUT", f"/api/forward-rules/{rule2['id']}", {"origin_port": 9090, "origin_host": "origin.example.com", "enabled": True})["result"]
-        check("rule2 merged into 9090", merged["cf_ruleset_id"] == updated["cf_ruleset_id"])
+        merged = req(
+            "PUT",
+            f"/api/forward-rules/{rule2['id']}",
+            {"origin_port": 9090, "origin_host": "origin.example.com", "enabled": True},
+        )["result"]
+        check(
+            "rule2 merged into 9090",
+            merged["cf_ruleset_id"] == updated["cf_ruleset_id"],
+        )
         check("rule2 cf_rule_id merged", merged["cf_rule_id"] == updated["cf_rule_id"])
 
         # 只改目标地址：DNS 原地更新
         dns_id = merged["dns_record_id"]
-        changed = req("PUT", f"/api/forward-rules/{rule2['id']}", {"origin_port": 9090, "origin_host": "9.9.9.9", "enabled": True})["result"]
-        check("dns type changed to A", state["dns"][changed["dns_record_id"]]["type"] == "A", state["dns"].get(changed["dns_record_id"]))
+        changed = req(
+            "PUT",
+            f"/api/forward-rules/{rule2['id']}",
+            {"origin_port": 9090, "origin_host": "9.9.9.9", "enabled": True},
+        )["result"]
+        check(
+            "dns type changed to A",
+            state["dns"][changed["dns_record_id"]]["type"] == "A",
+            state["dns"].get(changed["dns_record_id"]),
+        )
         check("old dns removed", dns_id not in state["dns"])
 
         # 删除 rule1：共享规则保留 rule2
         req("DELETE", f"/api/forward-rules/{rule1['id']}")
         check("rule1 dns deleted", rule1["dns_record_id"] not in state["dns"])
         rs = state["rulesets"][updated["cf_ruleset_id"]]
-        check("shared rule keeps rule2 host", rule1["hostname"] not in rs["rules"][0]["expression"] and changed["hostname"] in rs["rules"][0]["expression"])
+        check(
+            "shared rule keeps rule2 host",
+            rule1["hostname"] not in rs["rules"][0]["expression"]
+            and changed["hostname"] in rs["rules"][0]["expression"],
+        )
 
         # 删除 rule2：ruleset 清理
         req("DELETE", f"/api/forward-rules/{rule2['id']}")
-        check("ruleset deleted after last rule", updated["cf_ruleset_id"] not in state["rulesets"])
+        check(
+            "ruleset deleted after last rule",
+            updated["cf_ruleset_id"] not in state["rulesets"],
+        )
         check("all dns deleted", state["dns"] == {})
 
         # Origin 证书缓存
-        cert1 = req("POST", "/api/origin-certificates", {"zone_id": zone_id, "hostnames": ["A.example.com", "b.example.com"]})
-        check("cert generated", cert1["cached"] is False and cert1["result"]["certificate"].startswith("-----BEGIN CERTIFICATE"))
-        check("cert has private key", "BEGIN RSA PRIVATE KEY" in cert1["result"]["private_key"])
-        cert2 = req("POST", "/api/origin-certificates", {"zone_id": zone_id, "hostnames": ["b.example.com", "a.example.com"]})
+        cert1 = req(
+            "POST",
+            "/api/origin-certificates",
+            {"zone_id": zone_id, "hostnames": ["A.example.com", "b.example.com"]},
+        )
+        check(
+            "cert generated",
+            cert1["cached"] is False
+            and cert1["result"]["certificate"].startswith("-----BEGIN CERTIFICATE"),
+        )
+        check(
+            "cert has private key",
+            "BEGIN RSA PRIVATE KEY" in cert1["result"]["private_key"],
+        )
+        cert2 = req(
+            "POST",
+            "/api/origin-certificates",
+            {"zone_id": zone_id, "hostnames": ["b.example.com", "a.example.com"]},
+        )
         check("cert cache hit", cert2["cached"] is True)
 
         # 对账：手工删掉 CF 规则后，编辑/删除应自动补回
-        rule3 = req("POST", "/api/forward-rules", {"origin_port": 7070, "origin_host": "7.7.7.7", "enabled": True})["result"]
+        rule3 = req(
+            "POST",
+            "/api/forward-rules",
+            {"origin_port": 7070, "origin_host": "7.7.7.7", "enabled": True},
+        )["result"]
         req("POST", f"/api/forward-rules/{rule3['id']}/toggle")  # 先禁用，CF 规则禁用
         state["rulesets"].pop(rule3["cf_ruleset_id"], None)
         req("POST", f"/api/forward-rules/{rule3['id']}/toggle")  # 再启用，触发对账重建
@@ -488,15 +782,31 @@ def main():
         req("DELETE", f"/api/forward-rules/{rule3['id']}")
 
         # 无权限域名：创建第二个用户后不能使用未分配域名
-        user = req("POST", "/api/users", {"username": "bob", "password": "bob12345", "role": "user"})["result"]
-        bob_login = req("POST", "/api/auth/login", {"username": "bob", "password": "bob12345"}, auth=False)
+        user = req(
+            "POST",
+            "/api/users",
+            {"username": "bob", "password": "bob12345", "role": "user"},
+        )["result"]
+        bob_login = req(
+            "POST",
+            "/api/auth/login",
+            {"username": "bob", "password": "bob12345"},
+            auth=False,
+        )
         bob_token = bob_login["result"]["token"]
         old_token = token
         token = bob_token
         bob_rules = req("GET", "/api/forward-rules")["result"]
         check("bob sees no rules", bob_rules == [])
-        check("bob sees no zones", req("GET", "/api/forward-rules/zones")["result"] == [])
-        req("POST", "/api/forward-rules", {"origin_port": 1234, "origin_host": "1.1.1.1", "enabled": True}, expect=400)
+        check(
+            "bob sees no zones", req("GET", "/api/forward-rules/zones")["result"] == []
+        )
+        req(
+            "POST",
+            "/api/forward-rules",
+            {"origin_port": 1234, "origin_host": "1.1.1.1", "enabled": True},
+            expect=400,
+        )
         req("GET", "/api/users", expect=403)
         token = old_token
 

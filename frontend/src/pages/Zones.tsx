@@ -95,6 +95,7 @@ function Zones() {
             <p style={{ marginTop: 8 }}>
               域名 <strong>{zone.name}</strong> 已归属账号 <strong>{res.data.account_name}</strong>。
             </p>
+            <p>系统将自动为该域名开启 ECH（Encrypted Client Hello），可在系统设置中调整。</p>
             {nameServers.length > 0 ? (
               <>
                 <p>请到域名注册商处，把 NS 修改为 Cloudflare 提供的：</p>

@@ -146,6 +146,13 @@ export interface ForwardCheckReport {
   errors: string[]
 }
 
+export interface EchReport {
+  checked_at: string
+  checked_zones: number
+  enabled: number
+  errors: string[]
+}
+
 export interface PanelSettings {
   cf_api_token: string
   telegram_bot_token: string
@@ -154,6 +161,9 @@ export interface PanelSettings {
   check_interval_minutes: number
   check_auto_fix: boolean
   check_last_report: ForwardCheckReport | null
+  ech_auto_enable: boolean
+  ech_check_interval_minutes: number
+  ech_last_report: EchReport | null
 }
 export const getSettings = () =>
   api.get<CFResponse<PanelSettings>>('/settings')
@@ -174,6 +184,19 @@ export const runForwardCheck = () =>
 // 查询检查进度与最近一次结果
 export const getForwardCheckStatus = () =>
   api.get<CFResponse<ForwardCheckStatus>>('/forward-rules/check/status')
+
+// ECH（Encrypted Client Hello）自动开启
+export interface EchStatus {
+  running: boolean
+  last_report: EchReport | null
+  last_run: string | null
+}
+// 手动触发一次批量开启（后台执行，立即返回）
+export const enableEchAll = () =>
+  api.post<CFResponse<{ started: boolean; running: boolean }>>('/ech/enable')
+// 查询批量开启进度与最近一次结果
+export const getEchStatus = () =>
+  api.get<CFResponse<EchStatus>>('/ech/status')
 
 // Accounts
 export interface CFAccount {

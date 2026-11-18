@@ -59,6 +59,7 @@ async fn main() {
         jwt_secret: auth::generate_secret(),
         rate_limiter: api::rate_limit::RateLimiter::new(),
         forward_check_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        ech_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     });
 
     // 账号被封禁时，自动迁移其名下转发规则到其他账号（弱引用避免循环）。
@@ -78,6 +79,9 @@ async fn main() {
 
     // 定时检查 DNS / Origin Rules 是否与面板一致（间隔与自动修复可在系统设置中调整）。
     api::forward::spawn_forward_check_scheduler(state.clone());
+
+    // 定时确保所有域名开启 ECH（开关与间隔可在系统设置中调整）。
+    api::ech::spawn_ech_scheduler(state.clone());
 
     let addr = format!("0.0.0.0:{}", cfg.server_port);
     tracing::info!(%addr, "Server starting");

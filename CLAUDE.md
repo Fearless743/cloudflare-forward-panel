@@ -77,6 +77,8 @@ frontend (Vite/React18/AntD5, TS)  ——HTTP /api——>  backend-rs (Rust/axum
 
 6. **数据库兼容**：`db.rs` 的 `migrate()` 生成与 GORM AutoMigrate 等价的表结构，并补齐旧版本缺失的列（`must_change_password`、`cf_accounts.email/api_key/auth_type/account_id`、`zones.account_id`、`forward_rules.user_id/account_id/dns_record_id`）。时间列是 GORM 格式文本；JSON 输出时统一转 RFC3339。密码使用 bcrypt，与 Go 生成的 `$2a$` 哈希兼容。
 
+7. **ECH 自动开启（`api/ech.rs`）**：添加域名时立即对该 Zone 调用 `PATCH /zones/{zone_id}/settings/ech`（`value=on`）；后台 `spawn_ech_scheduler` 按系统设置中的间隔（默认 360 分钟，可关闭）遍历本地 `zones` 表全部域名复核并重新开启。管理员也可通过 `/api/ech/enable` 手动触发、`/api/ech/status` 轮询进度，前端在「系统设置」页展示开关与结果。ECH 的 API 错误不上报 `Manager`，避免套餐/权限不支持时误触发账号切换。
+
 ### 数据模型（`src/models.rs`）
 
 `users`（含订阅过期时间 `subscription`，NULL 表永久）、`settings`（KV 配置）、`cf_accounts`（多账号凭证）、`zones`（本地镜像 CF Zone）、`zone_users`（域名→用户多对多授权）、`forward_rules`（转发规则，关联 CF ruleset/dns ID）、`origin_certificates`（Origin 证书缓存）。注册商管理功能已从 Rust 后端、Go 旧后端与前端完全移除；旧数据库中可能遗留的 `domain_registrars` / `registrar_domains` 表不再被读写，也不会自动删除。

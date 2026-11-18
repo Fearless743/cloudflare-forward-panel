@@ -256,6 +256,11 @@ pub async fn create_zone(
         "[Admin] 域名操作"
     );
 
+    // 自动为该域名开启 ECH：尽力而为，失败只记录日志，不影响域名添加结果。
+    if !zone.id.is_empty() {
+        crate::api::ech::enable_ech_for_zone(&state, &zone.id).await;
+    }
+
     Ok(ok_json(json!({
         "success": true,
         "result": zone,
